@@ -48,7 +48,6 @@ class CombinedSim:
     def __init__(self, sim_cfg: CombinedSimConfig):
         self.cfg = sim_cfg
         self.humanoid_robot_cfg = sim_cfg.humanoid_robot_cfg
-        # self.quad_robot_path_mjcf = sim_cfg.quad_robot_path_mjcf
         self.quad_robot_cfg = sim_cfg.quad_robot_cfg
         self.quad_action_scale = sim_cfg.quad_action_scale
         self.headless = sim_cfg.headless
@@ -60,10 +59,14 @@ class CombinedSim:
         self.mjcf_root = mjcf.from_xml_string(DEFAULT_COMBINED_MJSCENE)
         if self.cfg.use_ground_plane:
             self.mjcf_root.worldbody.add("geom", **DEFAULT_GROUD_GEOM)
-        self._load_robot_quad(self.quad_robot_cfg.path_mjcf, pos = sim_cfg.quad_load_pos)
-        self._load_robot_humanoid(
-            self.cfg.humanoid_robot_cfg.path_mjcf
-        )
+        self._load_robot_quad(self.quad_robot_cfg.path_mjcf, pos=sim_cfg.quad_load_pos)
+        self._load_robot_humanoid(self.cfg.humanoid_robot_cfg.path_mjcf)
+
+        # mocap body 管理
+        self.available_mocap_ids = [f"debug_axis_{i}" for i in range(10)]  # 预定义 10 个 mocap body
+        self.mocap_bodies = {}  # 用户 ID 到 mocap 索引的映射
+        self.mocap_count = len(self.available_mocap_ids)
+
         # buffers
         self.launched = False
 
@@ -85,6 +88,12 @@ class CombinedSim:
         self.physics = mjcf.Physics.from_mjcf_model(self.mjcf_root)
         self.mj_model = self.physics.model._model
         self.mj_data = self.physics.data._data
+
+        # 调整 mocap 数组大小
+        if self.mocap_count > 0:
+            self.mj_data.mocap_pos.resize(self.mocap_count, 3)
+            self.mj_data.mocap_quat.resize(self.mocap_count, 4)
+
         # ctrl dof: 12+8
         # qpos dof: 19+20
         self.ctrl_humanoid_begin = 12
@@ -109,33 +118,19 @@ class CombinedSim:
 
         # modules
         if not self.headless:
-            self.viewer = mujoco.viewer.launch_passive(
-                self.mj_model,
-                self.mj_data,
-            )
+            self.viewer = mujoco.viewer.launch_passive(self.mj_model, self.mj_data)
             if self.viewer_cfg is not None:
                 self.viewer.cam.lookat[:] = self.viewer_cfg.lookat
                 self.viewer.cam.distance = self.viewer_cfg.distance
                 self.viewer.cam.azimuth = np.rad2deg(self.viewer_cfg.azimuth)
                 self.viewer.cam.elevation = np.rad2deg(self.viewer_cfg.elevation)
 
-        # if self.render_cfg is not None:
-        #     self.renderer = MovableCamera(
-        #         self.physics, height=self.render_cfg.height, width=self.render_cfg.width
-        #     )
-        #     self.renderer.set_pose(
-        #         self.render_cfg.lookat,
-        #         self.render_cfg.distance,
-        #         np.rad2deg(self.render_cfg.azimuth),
-        #         np.rad2deg(self.render_cfg.elevation),
-        #     )
         self.launched = True
 
     def reset(self, humanoid_head_qpos, humanoid_init_qpos, quad_init_joint_angles):
         assert self.launched, "Simulator not launched"
         self.humanoid_head_qpos = humanoid_head_qpos
         self.mj_data.qpos[self.humanoid_joint_ids] = humanoid_init_qpos.copy()
-        # self.mj_data.qpos[:3] = self.cfg.quad_reset_pos
         self.mj_data.qpos[:7] = self.quad_robot_cfg.default_pose.copy()
         self.mj_data.qpos[:3] = self.cfg.quad_reset_pos.copy()
         self.mj_data.qpos[7:self.qpos_humanoid_begin] = quad_init_joint_angles.copy()
@@ -152,7 +147,7 @@ class CombinedSim:
 
         if not self.headless:
             self.viewer.sync()
-    
+
     def step_reset(self):
         self.mj_data.ctrl = self.default_ctrl.copy()
         for _ in range(int(self.ctrl_dt / self.sim_dt)):
@@ -164,7 +159,7 @@ class CombinedSim:
     def __set_driller_pose(self, driller_pose):
         self.physics.named.data.qpos['//unnamed_joint_1'] = driller_pose
         self.physics.forward()
-    
+
     def __update_driller_pose(self):
         trans_quad = self.mj_data.qpos[:3]
         quat_quad = self.mj_data.qpos[3:7]
@@ -180,20 +175,23 @@ class CombinedSim:
         return np.asanyarray(self.physics.named.data.qpos['//unnamed_joint_1']).copy()
 
     def step(self, humanoid_head_qpos, humanoid_arm_action, quad_poses, quad_qposes, update=1):
-        if humanoid_head_qpos is not None: self.humanoid_head_qpos = humanoid_head_qpos
-        if humanoid_arm_action is None: humanoid_arm_action = self.cached_humanoid_action.copy()
-        else: self.cached_humanoid_action = humanoid_arm_action.copy()
-        
+        if humanoid_head_qpos is not None:
+            self.humanoid_head_qpos = humanoid_head_qpos
+        if humanoid_arm_action is None:
+            humanoid_arm_action = self.cached_humanoid_action.copy()
+        else:
+            self.cached_humanoid_action = humanoid_arm_action.copy()
+
         self.mj_data.ctrl[self.humanoid_actuator_ids] = humanoid_arm_action
-        steps = int(self.ctrl_dt/self.sim_dt)
-        assert steps==len(quad_poses)
+        steps = int(self.ctrl_dt / self.sim_dt)
+        assert steps == len(quad_poses)
         for i in range(steps):
             quad_pose = quad_poses[i]
             quad_qpos = quad_qposes[i]
-            
+
             self.mj_data.qpos[:7] = quad_pose.copy()
             self.mj_data.qpos[7:self.qpos_humanoid_begin] = quad_qpos.copy()
-            self.mj_data.qvel[:self.qpos_humanoid_begin-1] = 0.0
+            self.mj_data.qvel[:self.qpos_humanoid_begin - 1] = 0.0
             self.mj_data.ctrl[self.quad_actuator_ids] = quad_qpos.copy()
             mujoco.mj_forward(self.mj_model, self.mj_data)
             for _ in range(update):
@@ -232,8 +230,6 @@ class CombinedSim:
         )
 
         if render_cfg is not None:
-            # self.physics.model.vis.global_.offwidth = render_cfg.width
-            # self.physics.model.vis.global_.offheight = render_cfg.height
             renderer = MovableCamera(
                 self.physics, height=render_cfg.height, width=render_cfg.width
             )
@@ -254,6 +250,8 @@ class CombinedSim:
             self.viewer.close()
         self.physics.free()
         self.launched = False
+        self.mocap_bodies = {}
+        self.available_mocap_ids = [f"debug_axis_{i}" for i in range(10)]
 
     def _load_robot_humanoid(self, robot_mjcf: str):
         assert robot_mjcf is not None, f"robot_mjcf is None, {robot_mjcf}"
@@ -262,10 +260,9 @@ class CombinedSim:
         with temp_work_dir(robot_mjcf):
             robot_xml = mjcf.from_file(robot_mjcf)
             self.mjcf_root.attach(robot_xml)
-    
-    def _load_robot_quad(self, robot_mjcf: str, pos = [1,0,0.445]):
+
+    def _load_robot_quad(self, robot_mjcf: str, pos=[1, 0, 0.445]):
         robot_mjcf = os.path.abspath(robot_mjcf)
-        # print(robot_mjcf)
         with temp_work_dir(robot_mjcf):
             quad_robot = mjcf.from_file(robot_mjcf)
             body = self.mjcf_root.attach(quad_robot)
@@ -273,14 +270,9 @@ class CombinedSim:
             body.add("freejoint")
 
     def _add_geom_primitive(self, body, obj: Box):
-        # process obj prop
-        geom_prop = dict(
-            name=obj.name,
-        )
+        geom_prop = dict(name=obj.name)
         if obj.color is not None:
-            geom_prop["rgba"] = (
-                obj.color if len(obj.color) == 4 else np.append(obj.color, 1)
-            )
+            geom_prop["rgba"] = obj.color if len(obj.color) == 4 else np.append(obj.color, 1)
         if isinstance(obj, Box):
             geom_prop["type"] = "box"
             geom_prop["size"] = np.float32(obj.size) / 2.0
@@ -290,7 +282,6 @@ class CombinedSim:
         self.geom_dict[obj.name] = [obj.name]
 
     def _add_geom_meshes(self, body, obj: Mesh):
-        # mesh prop
         if obj.path is not None:
             if hasattr(obj, "convex_decompose_paths"):
                 path_list_collision = obj.convex_decompose_paths
@@ -301,25 +292,16 @@ class CombinedSim:
                 geom_name = f"{obj.name}_collision_{i}"
                 self.geom_dict[obj.name].append(geom_name)
                 self._add_mesh(body, obj, geom_name, coll_path, False)
-
         else:
             raise NotImplementedError
 
     def _add_mesh(self, body, obj, mesh_name, path, is_visual=False):
-        mesh_prop = dict(
-            name=mesh_name,
-            file=path,
-        )
+        mesh_prop = dict(name=mesh_name, file=path)
         if obj.scale is not None:
             assert len(obj.scale) == 3, f"scale must be 3D, {obj.scale}"
             mesh_prop["scale"] = obj.scale
         self.mjcf_root.asset.add("mesh", **mesh_prop)
-        geom_prop = dict(
-            name=mesh_name,
-            type="mesh",
-            mesh=mesh_name,
-            condim=6,
-        )
+        geom_prop = dict(name=mesh_name, type="mesh", mesh=mesh_name, condim=6)
         body.add("geom", **geom_prop)
 
     @property
@@ -334,22 +316,36 @@ class CombinedSim:
         pos = self.mj_data.xpos[body_id]
         rot = self.mj_data.xmat[body_id].reshape(3, 3)
         return pos, rot
-    
+
     def _debug_get_driller_pose(self):
         return self.__get_driller_pose()
-    
+
     def _debug_get_body_pose(self, body_name):
         return self.__get_body_pose(body_name)
-    
+
     def _debug_get_quad_pose(self):
         pose_array = self.mj_data.qpos[:7].copy()
         return pose_array
-        
-    def debug_vis_pose(self, pose):
-        self.mj_data.mocap_pos[0] = pose[:3, 3]
-        self.mj_data.mocap_quat[0] = mat2quat(pose[:3, :3])
-        if not self.headless:
+
+    def debug_vis_pose(self, pose: np.ndarray, mocap_id: str):
+        """Visualize a pose with a specific mocap ID using pre-defined mocap bodies."""
+        if mocap_id not in self.mocap_bodies:
+            if not self.available_mocap_ids:
+                raise ValueError("No more available mocap bodies")
+            mocap_name = self.available_mocap_ids.pop(0)
+            mocap_index = int(mocap_name.split('_')[-1])  # 提取索引
+            self.mocap_bodies[mocap_id] = mocap_index
+        else:
+            mocap_index = self.mocap_bodies[mocap_id]
+
+        # 更新 mocap 数据
+        self.mj_data.mocap_pos[mocap_index] = pose[:3, 3].copy()
+        self.mj_data.mocap_quat[mocap_index] = mat2quat(pose[:3, :3]).copy()
+
+        # 更新模拟和显示
+        if self.launched:
             mujoco.mj_forward(self.mj_model, self.mj_data)
             if self._fix_driller:
                 self.__update_driller_pose()
-            self.viewer.sync()
+            if not self.headless:
+                self.viewer.sync()

@@ -276,7 +276,7 @@ def main():
     # env.sim.debug_vis_pose(to_pose(np.array([1,0,0]), np.eye(3)))
     # env.sim.debug_vis_pose(to_pose(np.array([0,1,0]), np.eye(3)))
     # env.sim.debug_vis_pose(to_pose(np.array([0,0,1]), np.eye(3)))
-    # env.sim.debug_vis_pose(to_pose(np.array([0.81728007,-0.17410339,0.36550336]), np.eye(3)))
+    env.sim.debug_vis_pose(to_pose(np.array([0.5,-1,1]), np.eye(3)), mocap_id='debug_axis_0')
 
     runtime_name = time.strftime("%Y%m%d_%H%M%S")
 
@@ -336,7 +336,7 @@ def main():
                     trans_container_world = rot_marker_world @ np.array([0, -0.31, 0.02]) + trans_marker_world
                     rot_container_world = rot_marker_world
                     pose_container_world = to_pose(trans_container_world, rot_container_world)
-                    env.sim.debug_vis_pose(pose_container_world)
+                    env.sim.debug_vis_pose(pose_container_world, mocap_id='debug_axis_1')  # Visualize the container pose
                 else:
                     pose_container_world = None
 
