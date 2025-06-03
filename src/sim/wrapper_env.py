@@ -226,20 +226,27 @@ class WrapperEnv:
                     
 
 
-    def debug_save_obs(self, obs: Obs, data_dir=None):
+    def debug_save_obs(self, obs: Obs, runtime_name: str, step: int):
         """Save the observation to the specified directory."""
-        if data_dir is None:
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            data_dir = os.path.join("data", "pose2", timestamp)
-        os.makedirs(data_dir, exist_ok=True)
-        # clear the directory
-        for f in os.listdir(data_dir):
-            os.remove(os.path.join(data_dir, f))
-        Image.fromarray(obs.rgb).save(os.path.join(data_dir, "rgb.png"))
+        # if data_dir is None:
+        #     timestamp = time.strftime("%Y%m%d_%H%M%S")
+        #     data_dir = os.path.join("data", "pose2", timestamp)
+        # os.makedirs(data_dir, exist_ok=True)
+        # # clear the directory
+        # for f in os.listdir(data_dir):
+        #     os.remove(os.path.join(data_dir, f))
+
+        """ my own customized dir """
+        data_dir = os.path.join("data", runtime_name)
+        os.makedirs(os.path.join(data_dir, 'depth'), exist_ok=True)
+        os.makedirs(os.path.join(data_dir, 'rgb'), exist_ok=True)
+        os.makedirs(os.path.join(data_dir, 'camera_pose'), exist_ok=True)
+        
+        Image.fromarray(obs.rgb).save(os.path.join(data_dir, "rgb", f"rgb_{step}.png"))
         Image.fromarray(
             (np.clip(obs.depth, 0, 2.0) * DEPTH_IMG_SCALE).astype(np.uint16)
-        ).save(os.path.join(data_dir, "depth.png"))
-        np.save(os.path.join(data_dir, "camera_pose.npy"), obs.camera_pose)
+        ).save(os.path.join(data_dir, "depth", f"depth_{step}.png"))
+        np.save(os.path.join(data_dir, "camera_pose", f"camera_pose_{step}.npy"), obs.camera_pose)
 
     def get_quad_pose(self) -> np.ndarray:
         pose_array = self.sim._debug_get_quad_pose()

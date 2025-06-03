@@ -2,7 +2,6 @@ import argparse
 from typing import Optional, Tuple, List
 import numpy as np
 import cv2
-import time
 from pyapriltags import Detector
 
 from src.type import Grasp
@@ -16,8 +15,6 @@ def detect_driller_pose(img, depth, camera_matrix, camera_pose, *args, **kwargs)
     """
     Detects the pose of driller, you can include your policy in args
     """
-    # implement the detection logic here
-    # 
     pose = np.eye(4)
     return pose
 
@@ -44,7 +41,7 @@ def detect_marker_pose(
     return None, None, None
 
 def forward_quad_policy(current_pose, target_pose, *args, **kwargs):
-    """根据当前盒子位姿和目标位姿计算四足机器人命令"""
+    """Calculate quadruped command based on current and target box pose"""
     cprint("Calculating quad command...", 'yellow')
     current_trans = current_pose[:3, 3]
     target_trans = target_pose
@@ -54,35 +51,29 @@ def forward_quad_policy(current_pose, target_pose, *args, **kwargs):
     cprint(f"Direction: {direction}", 'yellow')
     distance = np.linalg.norm(direction)
     if distance > 0.01:
-        velocity = direction / distance * 0.5  # 速度大小为 0.1 m/s
+        velocity = direction / distance * 0.1  # Speed of 0.1 m/s
     else:
         velocity = np.array([0, 0, 0])
-    action = np.array([-velocity[0], -velocity[1], 0])  # xy 平面速度，角速度为 0, 机器狗头朝-x所以加个负号
+    action = np.array([-velocity[0], velocity[1], 0])  # xy plane velocity, negative due to robot orientation
     return action
 
 def backward_quad_policy(pose, target_pose, *args, **kwargs):
-    """ guide the quadruped back to its initial position """
-    # implement
-    action = np.array([0,0,0])
+    """Guide the quadruped back to its initial position"""
+    action = np.array([0, 0, 0])
     return action
 
 def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> Optional[List[np.ndarray]]:
-    """Try to plan a grasp trajectory for the given grasp. The trajectory is a list of joint positions. Return None if the trajectory is not valid."""
-
+    """Plan a grasp trajectory for the given grasp"""
     reach_steps = grasp_config.get('reach_steps', 20)
     lift_steps = grasp_config.get('lift_steps', 15)
     squeeze_steps = grasp_config.get('squeeze_steps', 10)
     delta_dist = grasp_config.get('delta_dist', 0.03)
     
-    # 获取当前机器人状态
     current_qpos = env.get_state()[:7]
-    
-    # 考虑夹爪深度调整抓取位置
     gripper_depth = 0.02  
     adjusted_grasp_trans = grasp.trans - gripper_depth * grasp.rot[:, 0]
     target_rot = grasp.rot
     
-    # 计算最终抓取位置的逆运动学
     try:
         success, grasp_arm_qpos = env.sim.humanoid_robot_model.ik(
             trans=adjusted_grasp_trans,
@@ -95,17 +86,14 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
     except Exception:
         return None
     
-    # 阶段1: 反向规划接近轨迹
     approach_trajectory = []
     cur_trans = adjusted_grasp_trans.copy()
     cur_rot = target_rot.copy()
     cur_qpos = grasp_arm_qpos.copy()
     
-    # 从抓取位置开始，向后规划接近点
-    valid_approach_points = [grasp_arm_qpos.copy()]  # 抓取位置作为最后一个点
+    valid_approach_points = [grasp_arm_qpos.copy()]
     
     for step in range(reach_steps):
-        # 沿着抓取方向反向移动
         cur_trans = cur_trans - delta_dist * cur_rot[:, 0]
         try:
             success, cur_qpos = env.sim.humanoid_robot_model.ik(
@@ -115,46 +103,38 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
                 retry_times=3
             )
             if success:
-                valid_approach_points.insert(0, cur_qpos.copy())  # 插入到前面
+                valid_approach_points.insert(0, cur_qpos.copy())
             else:
                 break
         except Exception:
             break
     
-    # 从当前位置连接到第一个接近点
     traj_reach = []
     if len(valid_approach_points) > 1:
-        # 从当前位置到第一个接近点
         first_approach_point = valid_approach_points[0]
         connection_steps = 20
         for i in range(connection_steps):
             alpha = (i + 1) / connection_steps
             interpolated_qpos = current_qpos + alpha * (first_approach_point - current_qpos)
             traj_reach.append(interpolated_qpos.copy())
-        
-        # 添加所有接近点
         traj_reach.extend(valid_approach_points)
     else:
-        # 如果接近轨迹规划失败，直接从当前位置到抓取位置
         direct_steps = max(reach_steps, 20)
         for i in range(direct_steps):
             alpha = (i + 1) / direct_steps
             interpolated_qpos = current_qpos + alpha * (grasp_arm_qpos - current_qpos)
             traj_reach.append(interpolated_qpos.copy())
     
-    # 阶段2: 夹取轨迹（保持位置，为夹爪控制预留时间）"
     traj_squeeze = []
     for i in range(squeeze_steps):
         traj_squeeze.append(grasp_arm_qpos.copy())
     
-    # 阶段3: 抬起轨迹（参考官方代码的垂直抬起逻辑）
     traj_lift = []
     cur_trans = adjusted_grasp_trans.copy()
     cur_rot = target_rot.copy()
     cur_qpos = grasp_arm_qpos.copy()
     
     for step in range(lift_steps):
-        # 垂直向上抬起
         cur_trans[2] += delta_dist
         try:
             success, cur_qpos = env.sim.humanoid_robot_model.ik(
@@ -166,49 +146,44 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
             if success:
                 traj_lift.append(cur_qpos.copy())
             else:
-                # 如果IK失败，保持当前位置
                 traj_lift.append(grasp_arm_qpos.copy())
         except Exception:
             traj_lift.append(grasp_arm_qpos.copy())
     
-    # 检查轨迹有效性
     if len(traj_reach) == 0:
         return None
     
     return [np.array(traj_reach), np.array(traj_squeeze), np.array(traj_lift)]
 
-def plan_move(env: WrapperEnv, begin_qpos, begin_trans, begin_rot, end_trans, end_rot, steps = 50, *args, **kwargs):
+def plan_move(env: WrapperEnv, begin_qpos, begin_trans, begin_rot, end_trans, end_rot, steps=50, *args, **kwargs):
     """Plan a trajectory moving the driller from table to dropping position"""
-    # implement
     traj = []
-
     succ = False
-    if not succ: return None
+    if not succ:
+        return None
     return traj
 
-def open_gripper(env: WrapperEnv, steps = 10):
+def open_gripper(env: WrapperEnv, steps=10):
     for _ in range(steps):
         env.step_env(gripper_open=1)
-def close_gripper(env: WrapperEnv, steps = 10):
+
+def close_gripper(env: WrapperEnv, steps=10):
     for _ in range(steps):
         env.step_env(gripper_open=0)
+
 def plan_move_qpos(begin_qpos, end_qpos, steps=50) -> np.ndarray:
     delta_qpos = (end_qpos - begin_qpos) / steps
     cur_qpos = begin_qpos.copy()
     traj = []
-    
     for _ in range(steps):
         cur_qpos += delta_qpos
         traj.append(cur_qpos.copy())
-    
     return np.array(traj)
-def execute_plan(env: WrapperEnv, plan):
-    """Execute the plan in the environment."""
-    for step in range(len(plan)):
-        env.step_env(
-            humanoid_action=plan[step],
-        )
 
+def execute_plan(env: WrapperEnv, plan):
+    """Execute the plan in the environment"""
+    for step in range(len(plan)):
+        env.step_env(humanoid_action=plan[step])
 
 TESTING = True
 DISABLE_GRASP = False
@@ -243,7 +218,6 @@ def main():
         reset_wait_steps=args.reset_wait_steps,
     )
 
-
     env = WrapperEnv(env_config)
     if TESTING:
         data_dict = load_test_data(args.test_id)
@@ -263,33 +237,26 @@ def main():
         'quad_return': False,
     }
     
-    head_init_qpos = np.array([0.0,0.0]) # you can adjust the head init qpos to find the driller
+    head_init_qpos = np.array([0.0, 0.0])  # Initial head position
 
     env.step_env(humanoid_head_qpos=head_init_qpos)
     
-    observing_qpos = humanoid_init_qpos + np.array([0.01,0,0,0,0,0,0]) # you can customize observing qpos to get wrist obs
-    init_plan = plan_move_qpos(humanoid_init_qpos, observing_qpos, steps = 20)
+    observing_qpos = humanoid_init_qpos + np.array([0.01, 0, 0, 0, 0, 0, 0])
+    init_plan = plan_move_qpos(humanoid_init_qpos, observing_qpos, steps=20)
     execute_plan(env, init_plan)
 
-    """ mzy - debug """
-    # env.sim.debug_vis_pose(to_pose(np.array([0,0,0]), np.eye(3)))
-    # env.sim.debug_vis_pose(to_pose(np.array([1,0,0]), np.eye(3)))
-    # env.sim.debug_vis_pose(to_pose(np.array([0,1,0]), np.eye(3)))
-    # env.sim.debug_vis_pose(to_pose(np.array([0,0,1]), np.eye(3)))
-    # env.sim.debug_vis_pose(to_pose(np.array([0.81728007,-0.17410339,0.36550336]), np.eye(3)))
-
-    runtime_name = time.strftime("%Y%m%d_%H%M%S")
-
-    # --------------------------------------step 1: move quadruped to dropping position--------------------------------------
+    # Step 1: Move quadruped to dropping position with head tracking
     if not DISABLE_MOVE:
         forward_steps = 1000
         steps_per_camera_shot = 5
         head_camera_matrix = env.sim.humanoid_robot_cfg.camera_cfg[0].intrinsics
         head_camera_params = (head_camera_matrix[0, 0], head_camera_matrix[1, 1], head_camera_matrix[0, 2], head_camera_matrix[1, 2])
-        target_container_pose = np.array([0.7, 0.0, 0.0])
+        target_container_pose = np.array([0.3, 0.0, 0.0])
         
         # Proportional control gain
         Kp = 0.5
+
+        env.sim.debug_vis_pose(to_pose(np.array([0.1, 0.0, 0.0]), np.eye(3)))
 
         def is_close(current_pose, target_pose, threshold=0.05):
             distance = np.linalg.norm(current_pose[:2] - target_pose[:2])
@@ -298,7 +265,6 @@ def main():
         for step in range(forward_steps):
             if step % steps_per_camera_shot == 0:
                 obs_head = env.get_obs(camera_id=0)
-                # env.debug_save_obs(obs_head, runtime_name=runtime_name, step=step)  # Save head camera observation, DEBUG
                 img_height, img_width = obs_head.rgb.shape[:2]
                 image_center = (img_width / 2, img_height / 2)
 
@@ -311,13 +277,13 @@ def main():
                 )
 
                 # Head tracking logic
-                current_head_qpos = env.sim.humanoid_head_qpos  # Last two joints are head joints
+                current_head_qpos = env.get_state()[-2:]  # Last two joints are head joints
                 if marker_center is not None:
                     # Calculate pixel deviation
                     delta_x = marker_center[0] - image_center[0]
                     delta_y = marker_center[1] - image_center[1]
-                    # cprint(f"Marker center: {marker_center}, Image center: {image_center}", 'cyan')
-                    # cprint(f"Delta x: {delta_x}, Delta y: {delta_y}", 'cyan')
+                    cprint(f"Marker center: {marker_center}, Image center: {image_center}", 'cyan')
+                    cprint(f"Delta x: {delta_x}, Delta y: {delta_y}", 'cyan')
 
                     # Convert pixel deviation to angular deviation using focal lengths
                     fx = head_camera_matrix[0, 0]
@@ -326,9 +292,8 @@ def main():
                     angle_delta_y = np.arctan(delta_y / fy)
 
                     # Apply proportional control
-                    head_qpos_adjustment = Kp * np.array([-angle_delta_x, angle_delta_y])  # Negative due to joint orientation
+                    head_qpos_adjustment = Kp * np.array([-angle_delta_x, -angle_delta_y])  # Negative due to joint orientation
                     new_head_qpos = current_head_qpos + head_qpos_adjustment
-                    # cprint(f"Current head qpos: {current_head_qpos}, New head qpos: {new_head_qpos}", 'cyan')
                 else:
                     new_head_qpos = current_head_qpos  # No adjustment if marker not detected
 
@@ -353,30 +318,27 @@ def main():
                     quad_command=quad_command
                 )
 
-
-    # --------------------------------------step 2: detect driller pose------------------------------------------------------
+    # Step 2: Detect driller pose
     if not DISABLE_GRASP:
-        obs_wrist = env.get_obs(camera_id=1) # wrist camera
+        obs_wrist = env.get_obs(camera_id=1)
         rgb, depth, camera_pose = obs_wrist.rgb, obs_wrist.depth, obs_wrist.camera_pose
         wrist_camera_matrix = env.sim.humanoid_robot_cfg.camera_cfg[1].intrinsics
         driller_pose = detect_driller_pose(rgb, depth, wrist_camera_matrix, camera_pose[:3, 3])
-        # metric judgement
         Metric['obj_pose'] = env.metric_obj_pose(driller_pose)
 
-
-    # --------------------------------------step 3: plan grasp and lift------------------------------------------------------
+    # Step 3: Plan grasp and lift
     if not DISABLE_GRASP:
         obj_pose = driller_pose.copy()
-        grasps = get_grasps(args.obj) 
-        grasps0_n = Grasp(grasps[0].trans, grasps[0].rot @ np.diag([-1,-1,1]), grasps[0].width)
-        grasps2_n = Grasp(grasps[2].trans, grasps[2].rot @ np.diag([-1,-1,1]), grasps[2].width)
+        grasps = get_grasps(args.obj)
+        grasps0_n = Grasp(grasps[0].trans, grasps[0].rot @ np.diag([-1, -1, 1]), grasps[0].width)
+        grasps2_n = Grasp(grasps[2].trans, grasps[2].rot @ np.diag([-1, -1, 1]), grasps[2].width)
         valid_grasps = [grasps[0], grasps0_n, grasps[2], grasps2_n]
         
-        grasp_config = dict( 
-            reach_steps=15,      # 接近步数
-            lift_steps=12,       # 抬起步数
-            squeeze_steps=8,     # 夹取步数
-            delta_dist=0.03,     # 每步移动距离（较小，更精确）
+        grasp_config = dict(
+            reach_steps=15,
+            lift_steps=12,
+            squeeze_steps=8,
+            delta_dist=0.03,
         )
 
         successful_grasp = False
@@ -399,60 +361,41 @@ def main():
             env.close()
             return
             
-        # 执行三阶段抓取，根据plan_grasp的返回值调整
         if len(grasp_plan) == 3:
             reach_plan, squeeze_plan, lift_plan = grasp_plan
         else:
             reach_plan, lift_plan = grasp_plan
-            squeeze_plan = np.array([reach_plan[-1]] * 8)  
+            squeeze_plan = np.array([reach_plan[-1]] * 8)
 
-        # 执行抓取序列
         print("Executing reach phase...")
         pregrasp_plan = plan_move_qpos(observing_qpos, reach_plan[0], steps=30)
         execute_plan(env, pregrasp_plan)
-        # 确保夹爪打开
         open_gripper(env, steps=10)
-        # 执行接近轨迹
         execute_plan(env, reach_plan)
         print("Executing squeeze phase...")
-        # 夹取阶段：保持位置，关闭夹爪
         execute_plan(env, squeeze_plan)
         close_gripper(env, steps=15)
         print("Executing lift phase...")
-        # 抬起阶段
         execute_plan(env, lift_plan)
         print("Grasp and lift completed")
-    # --------------------------------------step 4: plan to move and drop----------------------------------------------------
+
+    # Step 4: Plan to move and drop
     if not DISABLE_GRASP and not DISABLE_MOVE:
-        # implement your moving plan
-        #
-        move_plan = plan_move(
-            env=env,
-        ) 
+        move_plan = plan_move(env)
         execute_plan(env, move_plan)
         open_gripper(env)
 
-
-    # --------------------------------------step 5: move quadruped backward to initial position------------------------------
+    # Step 5: Move quadruped backward to initial position
     if not DISABLE_MOVE:
-        # implement
-        #
-        backward_steps = 1000 # customize by yourselves
+        backward_steps = 1000
         for step in range(backward_steps):
-            # same as before, please implement this
-            #
             quad_command = backward_quad_policy()
-            env.step_env(
-                quad_command=quad_command
-            )
-        
+            env.step_env(quad_command=quad_command)
 
-    # test the metrics
     Metric["drop_precision"] = Metric["drop_precision"] or env.metric_drop_precision()
     Metric["quad_return"] = Metric["quad_return"] or env.metric_quad_return()
 
-    print("Metrics:", Metric) 
-
+    print("Metrics:", Metric)
     print("Simulation completed.")
     env.close()
 
