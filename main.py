@@ -46,17 +46,114 @@ def backward_quad_policy(pose, target_pose, *args, **kwargs):
 
 def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> Optional[List[np.ndarray]]:
     """Try to plan a grasp trajectory for the given grasp. The trajectory is a list of joint positions. Return None if the trajectory is not valid."""
-    # implement
-    reach_steps = grasp_config['reach_steps']
-    lift_steps = grasp_config['lift_steps']
-    delta_dist = grasp_config['delta_dist']
 
+    reach_steps = grasp_config.get('reach_steps', 20)
+    lift_steps = grasp_config.get('lift_steps', 15)
+    squeeze_steps = grasp_config.get('squeeze_steps', 10)
+    delta_dist = grasp_config.get('delta_dist', 0.03)
+    
+    # 获取当前机器人状态
+    current_qpos = env.get_state()[:7]
+    
+    # 考虑夹爪深度调整抓取位置
+    gripper_depth = 0.02  
+    adjusted_grasp_trans = grasp.trans - gripper_depth * grasp.rot[:, 0]
+    target_rot = grasp.rot
+    
+    # 计算最终抓取位置的逆运动学
+    try:
+        success, grasp_arm_qpos = env.sim.humanoid_robot_model.ik(
+            trans=adjusted_grasp_trans,
+            rot=target_rot,
+            init_qpos=current_qpos,
+            retry_times=5
+        )
+        if not success:
+            return None
+    except Exception:
+        return None
+    
+    # 阶段1: 反向规划接近轨迹
+    approach_trajectory = []
+    cur_trans = adjusted_grasp_trans.copy()
+    cur_rot = target_rot.copy()
+    cur_qpos = grasp_arm_qpos.copy()
+    
+    # 从抓取位置开始，向后规划接近点
+    valid_approach_points = [grasp_arm_qpos.copy()]  # 抓取位置作为最后一个点
+    
+    for step in range(reach_steps):
+        # 沿着抓取方向反向移动
+        cur_trans = cur_trans - delta_dist * cur_rot[:, 0]
+        try:
+            success, cur_qpos = env.sim.humanoid_robot_model.ik(
+                trans=cur_trans,
+                rot=cur_rot,
+                init_qpos=cur_qpos,
+                retry_times=3
+            )
+            if success:
+                valid_approach_points.insert(0, cur_qpos.copy())  # 插入到前面
+            else:
+                break
+        except Exception:
+            break
+    
+    # 从当前位置连接到第一个接近点
     traj_reach = []
+    if len(valid_approach_points) > 1:
+        # 从当前位置到第一个接近点
+        first_approach_point = valid_approach_points[0]
+        connection_steps = 20
+        for i in range(connection_steps):
+            alpha = (i + 1) / connection_steps
+            interpolated_qpos = current_qpos + alpha * (first_approach_point - current_qpos)
+            traj_reach.append(interpolated_qpos.copy())
+        
+        # 添加所有接近点
+        traj_reach.extend(valid_approach_points)
+    else:
+        # 如果接近轨迹规划失败，直接从当前位置到抓取位置
+        direct_steps = max(reach_steps, 20)
+        for i in range(direct_steps):
+            alpha = (i + 1) / direct_steps
+            interpolated_qpos = current_qpos + alpha * (grasp_arm_qpos - current_qpos)
+            traj_reach.append(interpolated_qpos.copy())
+    
+    # 阶段2: 夹取轨迹（保持位置，为夹爪控制预留时间）"
+    traj_squeeze = []
+    for i in range(squeeze_steps):
+        traj_squeeze.append(grasp_arm_qpos.copy())
+    
+    # 阶段3: 抬起轨迹（参考官方代码的垂直抬起逻辑）
     traj_lift = []
-    succ = False
-    if not succ: return None
-
-    return [np.array(traj_reach), np.array(traj_lift)]
+    cur_trans = adjusted_grasp_trans.copy()
+    cur_rot = target_rot.copy()
+    cur_qpos = grasp_arm_qpos.copy()
+    
+    for step in range(lift_steps):
+        # 垂直向上抬起
+        cur_trans[2] += delta_dist
+        try:
+            success, cur_qpos = env.sim.humanoid_robot_model.ik(
+                trans=cur_trans,
+                rot=cur_rot,
+                init_qpos=cur_qpos,
+                retry_times=3
+            )
+            if success:
+                traj_lift.append(cur_qpos.copy())
+            else:
+                # 如果IK失败，保持当前位置
+                traj_lift.append(grasp_arm_qpos.copy())
+        except Exception:
+            traj_lift.append(grasp_arm_qpos.copy())
+    
+    # 检查轨迹有效性
+    if len(traj_reach) == 0:
+        return None
+    
+    return [np.array(traj_reach), np.array(traj_squeeze), np.array(traj_lift)]
 
 def plan_move(env: WrapperEnv, begin_qpos, begin_trans, begin_rot, end_trans, end_rot, steps = 50, *args, **kwargs):
     """Plan a trajectory moving the driller from table to dropping position"""
@@ -210,37 +307,58 @@ def main():
         grasps = get_grasps(args.obj) 
         grasps0_n = Grasp(grasps[0].trans, grasps[0].rot @ np.diag([-1,-1,1]), grasps[0].width)
         grasps2_n = Grasp(grasps[2].trans, grasps[2].rot @ np.diag([-1,-1,1]), grasps[2].width)
-        valid_grasps = [grasps[0], grasps0_n, grasps[2], grasps2_n] # we have provided some grasps, you can choose to use them or yours
+        valid_grasps = [grasps[0], grasps0_n, grasps[2], grasps2_n]
+        
         grasp_config = dict( 
-            reach_steps=0,
-            lift_steps=0,
-            delta_dist=0, 
-        ) # the grasping design in assignment 2, you can choose to use it or design yours
+            reach_steps=15,      # 接近步数
+            lift_steps=12,       # 抬起步数
+            squeeze_steps=8,     # 夹取步数
+            delta_dist=0.03,     # 每步移动距离（较小，更精确）
+        )
 
+        successful_grasp = False
+        grasp_plan = None
+        
         for obj_frame_grasp in valid_grasps:
             robot_frame_grasp = Grasp(
-                trans=obj_pose[:3, :3] @ obj_frame_grasp.trans
-                + obj_pose[:3, 3],
+                trans=obj_pose[:3, :3] @ obj_frame_grasp.trans + obj_pose[:3, 3],
                 rot=obj_pose[:3, :3] @ obj_frame_grasp.rot,
                 width=obj_frame_grasp.width,
             )
             grasp_plan = plan_grasp(env, robot_frame_grasp, grasp_config)
             if grasp_plan is not None:
+                successful_grasp = True
+                print(f"Successfully planned grasp with {len(grasp_plan)} phases")
                 break
-        if grasp_plan is None:
+                
+        if not successful_grasp:
             print("No valid grasp plan found.")
             env.close()
             return
-        reach_plan, lift_plan = grasp_plan
+            
+        # 执行三阶段抓取，根据plan_grasp的返回值调整
+        if len(grasp_plan) == 3:
+            reach_plan, squeeze_plan, lift_plan = grasp_plan
+        else:
+            reach_plan, lift_plan = grasp_plan
+            squeeze_plan = np.array([reach_plan[-1]] * 8)  
 
-        pregrasp_plan = plan_move_qpos(env, observing_qpos, reach_plan[0], steps=50) # pregrasp, change if you want
+        # 执行抓取序列
+        print("Executing reach phase...")
+        pregrasp_plan = plan_move_qpos(observing_qpos, reach_plan[0], steps=30)
         execute_plan(env, pregrasp_plan)
-        open_gripper(env)
+        # 确保夹爪打开
+        open_gripper(env, steps=10)
+        # 执行接近轨迹
         execute_plan(env, reach_plan)
-        close_gripper(env)
+        print("Executing squeeze phase...")
+        # 夹取阶段：保持位置，关闭夹爪
+        execute_plan(env, squeeze_plan)
+        close_gripper(env, steps=15)
+        print("Executing lift phase...")
+        # 抬起阶段
         execute_plan(env, lift_plan)
-
-
+        print("Grasp and lift completed")
     # --------------------------------------step 4: plan to move and drop----------------------------------------------------
     if not DISABLE_GRASP and not DISABLE_MOVE:
         # implement your moving plan
