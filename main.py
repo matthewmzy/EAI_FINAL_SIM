@@ -276,7 +276,7 @@ def main():
     # env.sim.debug_vis_pose(to_pose(np.array([1,0,0]), np.eye(3)))
     # env.sim.debug_vis_pose(to_pose(np.array([0,1,0]), np.eye(3)))
     # env.sim.debug_vis_pose(to_pose(np.array([0,0,1]), np.eye(3)))
-    env.sim.debug_vis_pose(to_pose(np.array([0.5,-1,1]), np.eye(3)), mocap_id='debug_axis_0')
+    env.sim.debug_vis_pose(to_pose(np.array([0.5,0.3,0.75]), np.eye(3)), mocap_id='debug_axis_0')   
 
     runtime_name = time.strftime("%Y%m%d_%H%M%S")
 
@@ -360,6 +360,10 @@ def main():
         rgb, depth, camera_pose = obs_wrist.rgb, obs_wrist.depth, obs_wrist.camera_pose
         wrist_camera_matrix = env.sim.humanoid_robot_cfg.camera_cfg[1].intrinsics
         driller_pose = detect_driller_pose(rgb, depth, wrist_camera_matrix, camera_pose[:3, 3])
+
+        # TODO: ma zhiyuan modified here, assume the driller_pose is detected correctly
+        driller_pose = np.array([[1,0,0,0.5],[0,1,0,0.3],[0,0,1,0.75],[0,0,0,1]])
+        
         # metric judgement
         Metric['obj_pose'] = env.metric_obj_pose(driller_pose)
 
