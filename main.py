@@ -4,6 +4,7 @@ import numpy as np
 import cv2
 import time
 from pyapriltags import Detector
+from ipdb import set_trace
 
 from src.type import Grasp
 from src.utils import to_pose
@@ -11,8 +12,48 @@ from src.sim.wrapper_env import WrapperEnvConfig, WrapperEnv
 from src.sim.wrapper_env import get_grasps
 from src.test.load_test import load_test_data
 from termcolor import cprint
+from assignment2_zzh.src.model.est_coord import EstCoordNet
+from assignment2_zzh.src.path import get_exp_config_from_checkpoint
+from assignment2_zzh.src.config import Config
 
 import torch
+
+import open3d as o3d
+import plotly.io as pio
+pio.renderers.default = "browser"
+import plotly.graph_objects as go
+def plotly_vis_points(points: np.ndarray, title: str = "Point Cloud"):
+    """Visualize a point cloud using Plotly."""
+    fig = go.Figure(data=[go.Scatter3d(
+        x=points[:, 0],
+        y=points[:, 1],
+        z=points[:, 2],
+        mode='markers',
+        marker=dict(size=2, color='blue')
+    )])
+    fig.update_layout(
+        title=title,
+        scene=dict(
+            xaxis_title='X',
+            yaxis_title='Y',
+            zaxis_title='Z',
+            aspectmode='data'
+        )
+    )
+    fig.show()
+
+def get_workspace_mask(pc: np.ndarray) -> np.ndarray:
+    """Get the mask of the point cloud in the workspace."""
+    # [0.5,0.3,0.75]
+    pc_mask = (
+        (pc[:, 0] > -0.63)
+        & (pc[:, 0] < -0.32)
+        & (pc[:, 1] > -0.045)
+        & (pc[:, 1] < 0.15)
+        & (pc[:, 2] > 0.752)
+        & (pc[:, 2] < 0.85)
+    )
+    return pc_mask
 
 def detect_driller_pose(img, depth, camera_matrix, camera_pose, *args, **kwargs):
     """
@@ -26,12 +67,12 @@ def detect_driller_pose(img, depth, camera_matrix, camera_pose, *args, **kwargs)
     if (img.shape[0], img.shape[1]) != (H, W):
         img = cv2.resize(img, (W, H))
         depth = cv2.resize(depth, (W, H), interpolation=cv2.INTER_NEAREST)
-    
+
     fx = camera_matrix[0,0]
     fy = camera_matrix[1,1]
     cx = camera_matrix[0,2]
     cy = camera_matrix[1,2]
-    
+
     # 生成网格坐标
     u, v = np.meshgrid(np.arange(W), np.arange(H))
     
@@ -41,77 +82,53 @@ def detect_driller_pose(img, depth, camera_matrix, camera_pose, *args, **kwargs)
     
     # 过滤无效点（深度<=0）
     valid_mask = z > 0
-    points = np.stack([x[valid_mask], y[valid_mask], z[valid_mask]], axis=1)  # (N,3)
+    points_camera = np.stack([x[valid_mask], y[valid_mask], z[valid_mask]], axis=1)  # (N,3)
+    # shuffle points
+    np.random.shuffle(points_camera)
+    plotly_vis_points(points_camera[:10000], title="Camera Points")  # 可视化前10000个点
+    points_world = np.einsum("ab,nb->na", camera_pose[:3, :3], points_camera) + camera_pose[:3, 3] # (N,3)
+    plotly_vis_points(points_world[:10000], title="World Points")  # 可视化前10000个点
+    camera_pose = np.linalg.inv(camera_pose)  # (4,4)
+    points_world = np.einsum("ab,nb->na", camera_pose[:3, :3], points_camera) + camera_pose[:3, 3] # (N,3)
+    plotly_vis_points(points_world[:10000], title="World Points")  # 可视化前10000个点
+    points_drill = points_world[get_workspace_mask(points_world)]  # 过滤到工作空间内的点
+    # 用open3d fps 降采样到1024个点
+    # pcd = o3d.geometry.PointCloud()
+    # pcd.points = o3d.utility.Vector3dVector(points_drill)
+    # pcd = pcd.farthest_point_down_sample(1024)  # 降采样到1024个点
+    # points_drill = np.asarray(pcd.points)  # (1024, 3)
 
-    class TempEstPoseNet(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.conv1 = torch.nn.Conv1d(3,64,1)
-            self.conv2 = torch.nn.Conv1d(64,128,1)
-            self.conv3 = torch.nn.Conv1d(128,1024,1)
-            self.fc1 = torch.nn.Linear(1024,512)
-            self.fc2 = torch.nn.Linear(512,256)
-            self.fc_trans = torch.nn.Linear(256,3)
-            self.fc_rot = torch.nn.Linear(256,9)
-            
-            self.bn1 = torch.nn.BatchNorm1d(64)
-            self.bn2 = torch.nn.BatchNorm1d(128)
-            self.bn3 = torch.nn.BatchNorm1d(1024)
-            self.bn4 = torch.nn.BatchNorm1d(512)
-            self.bn5 = torch.nn.BatchNorm1d(256)
-            self.relu = torch.nn.ReLU()
+    # 用plotly可视化一下
+    # plotly_vis_points(points_drill, title="Drill Points in Workspace")
 
-        def forward(self, x):
-            x = self.relu(self.bn1(self.conv1(x)))
-            x = self.relu(self.bn2(self.conv2(x)))
-            x = self.bn3(self.conv3(x))
-            x = torch.max(x, 2, keepdim=True)[0]
-            x = x.view(-1,1024)
-            x = self.relu(self.bn4(self.fc1(x)))
-            x = self.relu(self.bn5(self.fc2(x)))
-            trans = self.fc_trans(x)
-            rot = self.fc_rot(x).view(-1,3,3)
-            return trans, rot
+    # open3d 可视化一下points
+    # pcd = o3d.geometry.PointCloud()
+    # pcd.points = o3d.utility.Vector3dVector(points_drill)
+    # o3d.visualization.draw_geometries([pcd])
 
-    NUM_POINTS = 1024
-    
-    # 下采样
-    if len(points) > NUM_POINTS:
-        indices = np.random.choice(len(points), NUM_POINTS, replace=False)
-    else:
-        indices = np.random.choice(len(points), NUM_POINTS, replace=True)
-    points = points[indices]
-    
-    # 归一化
-    points -= np.mean(points, axis=0)
-    points /= np.max(np.linalg.norm(points, axis=1)) + 1e-6
-    
-    # 转换为张量 [1, 3, N]
-    pc_tensor = torch.from_numpy(points.T).unsqueeze(0).float()  # (1,3,1024)
-
-    model = TempEstPoseNet()
-    model.eval()
+    set_trace()
+    config = Config.from_yaml(get_exp_config_from_checkpoint(args[0]))
+    model = EstCoordNet(config)
+    model.load_state_dict(torch.load(args[0], map_location='cpu')['model'])
+    model.eval().to(args[1])
     
     with torch.no_grad():
-        pred_trans, pred_rot = model(pc_tensor)
-    
-    # 确保输出形状正确并去除批次维度
-    pred_rot = pred_rot.squeeze(0)  # (1,3,3) => (3,3)
-    pred_trans = pred_trans.squeeze(0)  # (1,3) => (3,)
+        # pred_trans, pred_rot = model.est(points[np.newaxis, ...].astype(np.float32).to(args[1]))
+        pred_trans, pred_rot = model.est(torch.from_numpy(points_drill[np.newaxis, ...]).to(args[1]).float())
+        pred_trans = pred_trans[0]
+        pred_rot = pred_rot[0]
 
-    driller_pose_cam = np.eye(4)
-    driller_pose_cam[:3, :3] = pred_rot.numpy()  # (3,3)
-    driller_pose_cam[:3, 3] = pred_trans.numpy()  # (3,)
+    driller_pose = np.eye(4)
+    driller_pose[:3, :3] = pred_rot.cpu().numpy()  # (3,3)
+    driller_pose[:3, 3] = pred_trans.cpu().numpy()  # (3,)
     print("Debug Info:")
     print(f"Camera pose shape: {camera_pose.shape}")      # (4,4)
-    print(f"Driller pose shape: {driller_pose_cam.shape}") # (4,4)
+    print(f"Driller pose shape: {driller_pose.shape}") # (4,4)
     print(f"Rotation matrix shape: {pred_rot.shape}")      # (3,3)
     print(f"Translation shape: {pred_trans.shape}")        # (3,)
-    
-    # 转换到世界坐标系
-    driller_pose_world = camera_pose @ driller_pose_cam
-    
-    return driller_pose_world
+
+ 
+    return driller_pose
     pose = np.eye(4)
     return pose
 
@@ -139,13 +156,13 @@ def detect_marker_pose(
 
 def forward_quad_policy(current_pose, target_pose, *args, **kwargs):
     """根据当前盒子位姿和目标位姿计算四足机器人命令"""
-    cprint("Calculating quad command...", 'yellow')
+    # cprint("Calculating quad command...", 'yellow')
     current_trans = current_pose[:3, 3]
     target_trans = target_pose
     direction = target_trans - current_trans
-    cprint(f"Current trans: {current_trans}", 'yellow')
-    cprint(f"Target trans: {target_trans}", 'yellow')
-    cprint(f"Direction: {direction}", 'yellow')
+    # cprint(f"Current trans: {current_trans}", 'yellow')
+    # cprint(f"Target trans: {target_trans}", 'yellow')
+    # cprint(f"Direction: {direction}", 'yellow')
     distance = np.linalg.norm(direction)
     if distance > 0.01:
         velocity = direction / distance * 0.5  # 速度大小为 0.1 m/s
@@ -319,6 +336,8 @@ def main():
     parser.add_argument("--headless", type=int, default=0)
     parser.add_argument("--reset_wait_steps", type=int, default=100)
     parser.add_argument("--test_id", type=int, default=0)
+    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--est_drill_ckpt", type=str, default="assignment2_zzh/exps/exp2/checkpoint/checkpoint_15000.pth")
 
     args = parser.parse_args()
 
@@ -459,7 +478,9 @@ def main():
         wrist_camera_matrix = env.sim.humanoid_robot_cfg.camera_cfg[1].intrinsics
         driller_pose = detect_driller_pose(rgb, depth,
                                             wrist_camera_matrix,
-                                              camera_pose)
+                                            camera_pose,
+                                            args.est_drill_ckpt,
+                                            args.device)
         print(driller_pose)
         print("CCCCC")
         env.sim.debug_vis_pose(driller_pose, mocap_id='debug_axis_2') 

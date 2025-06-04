@@ -135,9 +135,9 @@ class WrapperEnv:
 
     def get_obs(self, camera_id: int = 1) -> Obs:
         """Get the observation from the simulation, camera_id = 0 for head camera, camera_id = 1 for wrist camera."""
-        init_qpos = self.humanoid_robot_cfg.joint_init_qpos.copy()
+        qpos = self.get_state()
         if camera_id == 1:
-            cam_trans, cam_rot = self.humanoid_robot_model.fk_camera(init_qpos, camera_id)
+            cam_trans, cam_rot = self.humanoid_robot_model.fk_camera(qpos, camera_id)
         elif camera_id == 0:
             cam_trans, cam_rot = self.humanoid_robot_model.fk_camera(self.sim.humanoid_head_qpos, camera_id)
         else:
@@ -161,7 +161,7 @@ class WrapperEnv:
         return obs
     
     def get_state(self) -> Dict:
-        humanoid_qpos = self.sim.mj_data.qpos[self.sim.humanoid_actuator_ids]
+        humanoid_qpos = self.sim.mj_data.qpos[self.sim.humanoid_joint_ids]
         return humanoid_qpos
 
     def step_env(

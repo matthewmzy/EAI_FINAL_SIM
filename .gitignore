@@ -1,4 +1,6 @@
 data/
 __pycache__/
 *.zip
-assignment2-zzh
+assignment2_zzh/
+fix/
+origin_version/
