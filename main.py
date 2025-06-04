@@ -12,12 +12,106 @@ from src.sim.wrapper_env import get_grasps
 from src.test.load_test import load_test_data
 from termcolor import cprint
 
+import torch
+
 def detect_driller_pose(img, depth, camera_matrix, camera_pose, *args, **kwargs):
     """
     Detects the pose of driller, you can include your policy in args
     """
     # implement the detection logic here
     # 
+    H, W = 720, 1280
+    
+    # 调整输入到目标分辨率
+    if (img.shape[0], img.shape[1]) != (H, W):
+        img = cv2.resize(img, (W, H))
+        depth = cv2.resize(depth, (W, H), interpolation=cv2.INTER_NEAREST)
+    
+    fx = camera_matrix[0,0]
+    fy = camera_matrix[1,1]
+    cx = camera_matrix[0,2]
+    cy = camera_matrix[1,2]
+    
+    # 生成网格坐标
+    u, v = np.meshgrid(np.arange(W), np.arange(H))
+    
+    z = depth[v, u]  # (H, W)
+    x = (u - cx) * z / fx
+    y = (v - cy) * z / fy
+    
+    # 过滤无效点（深度<=0）
+    valid_mask = z > 0
+    points = np.stack([x[valid_mask], y[valid_mask], z[valid_mask]], axis=1)  # (N,3)
+
+    class TempEstPoseNet(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv1 = torch.nn.Conv1d(3,64,1)
+            self.conv2 = torch.nn.Conv1d(64,128,1)
+            self.conv3 = torch.nn.Conv1d(128,1024,1)
+            self.fc1 = torch.nn.Linear(1024,512)
+            self.fc2 = torch.nn.Linear(512,256)
+            self.fc_trans = torch.nn.Linear(256,3)
+            self.fc_rot = torch.nn.Linear(256,9)
+            
+            self.bn1 = torch.nn.BatchNorm1d(64)
+            self.bn2 = torch.nn.BatchNorm1d(128)
+            self.bn3 = torch.nn.BatchNorm1d(1024)
+            self.bn4 = torch.nn.BatchNorm1d(512)
+            self.bn5 = torch.nn.BatchNorm1d(256)
+            self.relu = torch.nn.ReLU()
+
+        def forward(self, x):
+            x = self.relu(self.bn1(self.conv1(x)))
+            x = self.relu(self.bn2(self.conv2(x)))
+            x = self.bn3(self.conv3(x))
+            x = torch.max(x, 2, keepdim=True)[0]
+            x = x.view(-1,1024)
+            x = self.relu(self.bn4(self.fc1(x)))
+            x = self.relu(self.bn5(self.fc2(x)))
+            trans = self.fc_trans(x)
+            rot = self.fc_rot(x).view(-1,3,3)
+            return trans, rot
+
+    NUM_POINTS = 1024
+    
+    # 下采样
+    if len(points) > NUM_POINTS:
+        indices = np.random.choice(len(points), NUM_POINTS, replace=False)
+    else:
+        indices = np.random.choice(len(points), NUM_POINTS, replace=True)
+    points = points[indices]
+    
+    # 归一化
+    points -= np.mean(points, axis=0)
+    points /= np.max(np.linalg.norm(points, axis=1)) + 1e-6
+    
+    # 转换为张量 [1, 3, N]
+    pc_tensor = torch.from_numpy(points.T).unsqueeze(0).float()  # (1,3,1024)
+
+    model = TempEstPoseNet()
+    model.eval()
+    
+    with torch.no_grad():
+        pred_trans, pred_rot = model(pc_tensor)
+    
+    # 确保输出形状正确并去除批次维度
+    pred_rot = pred_rot.squeeze(0)  # (1,3,3) => (3,3)
+    pred_trans = pred_trans.squeeze(0)  # (1,3) => (3,)
+
+    driller_pose_cam = np.eye(4)
+    driller_pose_cam[:3, :3] = pred_rot.numpy()  # (3,3)
+    driller_pose_cam[:3, 3] = pred_trans.numpy()  # (3,)
+    print("Debug Info:")
+    print(f"Camera pose shape: {camera_pose.shape}")      # (4,4)
+    print(f"Driller pose shape: {driller_pose_cam.shape}") # (4,4)
+    print(f"Rotation matrix shape: {pred_rot.shape}")      # (3,3)
+    print(f"Translation shape: {pred_trans.shape}")        # (3,)
+    
+    # 转换到世界坐标系
+    driller_pose_world = camera_pose @ driller_pose_cam
+    
+    return driller_pose_world
     pose = np.eye(4)
     return pose
 
@@ -73,7 +167,8 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
     lift_steps = grasp_config.get('lift_steps', 15)
     squeeze_steps = grasp_config.get('squeeze_steps', 10)
     delta_dist = grasp_config.get('delta_dist', 0.03)
-    
+    print(reach_steps)
+    print("AAAAA")
     # 获取当前机器人状态
     current_qpos = env.get_state()[:7]
     
@@ -84,13 +179,15 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
     
     # 计算最终抓取位置的逆运动学
     try:
-        success, grasp_arm_qpos = env.sim.humanoid_robot_model.ik(
+        success, grasp_arm_qpos = env.humanoid_robot_model.ik(
             trans=adjusted_grasp_trans,
             rot=target_rot,
             init_qpos=current_qpos,
             retry_times=5
         )
+        print(grasp_arm_qpos)
         if not success:
+            print("Not Success")
             return None
     except Exception:
         return None
@@ -276,7 +373,8 @@ def main():
     # env.sim.debug_vis_pose(to_pose(np.array([1,0,0]), np.eye(3)))
     # env.sim.debug_vis_pose(to_pose(np.array([0,1,0]), np.eye(3)))
     # env.sim.debug_vis_pose(to_pose(np.array([0,0,1]), np.eye(3)))
-    env.sim.debug_vis_pose(to_pose(np.array([0.5,0.3,0.75]), np.eye(3)), mocap_id='debug_axis_0')   
+    env.sim.debug_vis_pose(to_pose(np.array([0.5,0.3,0.75]),
+                                    np.eye(3)), mocap_id='debug_axis_0')   
 
     runtime_name = time.strftime("%Y%m%d_%H%M%S")
 
@@ -359,10 +457,15 @@ def main():
         obs_wrist = env.get_obs(camera_id=1) # wrist camera
         rgb, depth, camera_pose = obs_wrist.rgb, obs_wrist.depth, obs_wrist.camera_pose
         wrist_camera_matrix = env.sim.humanoid_robot_cfg.camera_cfg[1].intrinsics
-        driller_pose = detect_driller_pose(rgb, depth, wrist_camera_matrix, camera_pose[:3, 3])
+        driller_pose = detect_driller_pose(rgb, depth,
+                                            wrist_camera_matrix,
+                                              camera_pose)
+        print(driller_pose)
+        print("CCCCC")
+        env.sim.debug_vis_pose(driller_pose, mocap_id='debug_axis_2') 
 
         # TODO: ma zhiyuan modified here, assume the driller_pose is detected correctly
-        driller_pose = np.array([[1,0,0,0.5],[0,1,0,0.3],[0,0,1,0.75],[0,0,0,1]])
+        #driller_pose = np.array([[1,0,0,0.5],[0,1,0,0.3],[0,0,1,0.75],[0,0,0,1]])
         
         # metric judgement
         Metric['obj_pose'] = env.metric_obj_pose(driller_pose)
