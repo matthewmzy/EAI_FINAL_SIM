@@ -85,12 +85,12 @@ def detect_driller_pose(img, depth, camera_matrix, camera_pose, *args, **kwargs)
     points_camera = np.stack([x[valid_mask], y[valid_mask], z[valid_mask]], axis=1)  # (N,3)
     # shuffle points
     np.random.shuffle(points_camera)
-    plotly_vis_points(points_camera[:10000], title="Camera Points")  # 可视化前10000个点
+    # plotly_vis_points(points_camera[:10000], title="Camera Points")  # 可视化前10000个点
     points_world = np.einsum("ab,nb->na", camera_pose[:3, :3], points_camera) + camera_pose[:3, 3] # (N,3)
-    plotly_vis_points(points_world[:10000], title="World Points")  # 可视化前10000个点
+    # plotly_vis_points(points_world[:10000], title="World Points")  # 可视化前10000个点
     camera_pose = np.linalg.inv(camera_pose)  # (4,4)
     points_world = np.einsum("ab,nb->na", camera_pose[:3, :3], points_camera) + camera_pose[:3, 3] # (N,3)
-    plotly_vis_points(points_world[:10000], title="World Points")  # 可视化前10000个点
+    # plotly_vis_points(points_world[:10000], title="World Points")  # 可视化前10000个点
     points_drill = points_world[get_workspace_mask(points_world)]  # 过滤到工作空间内的点
     # 用open3d fps 降采样到1024个点
     # pcd = o3d.geometry.PointCloud()
@@ -106,7 +106,7 @@ def detect_driller_pose(img, depth, camera_matrix, camera_pose, *args, **kwargs)
     # pcd.points = o3d.utility.Vector3dVector(points_drill)
     # o3d.visualization.draw_geometries([pcd])
 
-    set_trace()
+    # set_trace()
     config = Config.from_yaml(get_exp_config_from_checkpoint(args[0]))
     model = EstCoordNet(config)
     model.load_state_dict(torch.load(args[0], map_location='cpu')['model'])
@@ -121,16 +121,9 @@ def detect_driller_pose(img, depth, camera_matrix, camera_pose, *args, **kwargs)
     driller_pose = np.eye(4)
     driller_pose[:3, :3] = pred_rot.cpu().numpy()  # (3,3)
     driller_pose[:3, 3] = pred_trans.cpu().numpy()  # (3,)
-    print("Debug Info:")
-    print(f"Camera pose shape: {camera_pose.shape}")      # (4,4)
-    print(f"Driller pose shape: {driller_pose.shape}") # (4,4)
-    print(f"Rotation matrix shape: {pred_rot.shape}")      # (3,3)
-    print(f"Translation shape: {pred_trans.shape}")        # (3,)
-
  
     return driller_pose
-    pose = np.eye(4)
-    return pose
+
 
 def detect_marker_pose(
         detector: Detector,
@@ -185,7 +178,6 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
     squeeze_steps = grasp_config.get('squeeze_steps', 10)
     delta_dist = grasp_config.get('delta_dist', 0.03)
     print(reach_steps)
-    print("AAAAA")
     # 获取当前机器人状态
     current_qpos = env.get_state()[:7]
     
@@ -288,7 +280,7 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
     # 检查轨迹有效性
     if len(traj_reach) == 0:
         return None
-    
+    set_trace()
     return [np.array(traj_reach), np.array(traj_squeeze), np.array(traj_lift)]
 
 def plan_move(env: WrapperEnv, begin_qpos, begin_trans, begin_rot, end_trans, end_rot, steps = 50, *args, **kwargs):
@@ -476,14 +468,13 @@ def main():
         obs_wrist = env.get_obs(camera_id=1) # wrist camera
         rgb, depth, camera_pose = obs_wrist.rgb, obs_wrist.depth, obs_wrist.camera_pose
         wrist_camera_matrix = env.sim.humanoid_robot_cfg.camera_cfg[1].intrinsics
-        driller_pose = detect_driller_pose(rgb, depth,
-                                            wrist_camera_matrix,
-                                            camera_pose,
-                                            args.est_drill_ckpt,
-                                            args.device)
+        # driller_pose = detect_driller_pose(rgb, depth,
+        #                                     wrist_camera_matrix,
+        #                                     camera_pose,
+        #                                     args.est_drill_ckpt,
+        #                                     args.device)
         driller_pose = env.get_driller_pose()
         print(driller_pose)
-        print("CCCCC")
         env.sim.debug_vis_pose(driller_pose, mocap_id='debug_axis_2') 
 
         # TODO: ma zhiyuan modified here, assume the driller_pose is detected correctly
