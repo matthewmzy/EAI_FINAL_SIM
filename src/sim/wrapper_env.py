@@ -144,13 +144,13 @@ class WrapperEnv:
             raise NotImplementedError
         
         cam_pose = to_pose(cam_trans, cam_rot)
-        render_cfg = MjRenderConfig.from_intrinsics_extrinsics(
-            self.humanoid_robot_cfg.camera_cfg[camera_id].height,
-            self.humanoid_robot_cfg.camera_cfg[camera_id].width,
-            self.humanoid_robot_cfg.camera_cfg[camera_id].intrinsics,
-            cam_pose.copy(),
-        )
-        x = self.sim.render(render_cfg)
+        # render_cfg = MjRenderConfig.from_intrinsics_extrinsics(
+        #     self.humanoid_robot_cfg.camera_cfg[camera_id].height,
+        #     self.humanoid_robot_cfg.camera_cfg[camera_id].width,
+        #     self.humanoid_robot_cfg.camera_cfg[camera_id].intrinsics,
+        #     cam_pose.copy(),
+        # )
+        x = self.sim.render(camera_id=camera_id, camera_pose=cam_pose)
 
         obs = Obs(
             rgb=x["rgb"],

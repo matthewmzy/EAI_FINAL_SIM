@@ -119,6 +119,12 @@ DEFAULT_COMBINED_MJSCENE = """
             <geom type="cylinder" fromto="0 0 0 0 0.1 0" size="0.005" rgba="0 1 0 0.2" contype="2" conaffinity="0" group="2"/>
             <geom type="cylinder" fromto="0 0 0 0 0 0.1" size="0.005" rgba="0 0 1 0.2" contype="2" conaffinity="0" group="2"/>
         </body>
+            <body name="camera_body_head" pos="0 0 1" mocap="true">
+            <camera name="moving_cam_head" mode="fixed" pos="0 0 0"/>
+        </body>
+            <body name="camera_body_wrist" pos="0 0 1" mocap="true">
+            <camera name="moving_cam_wrist" mode="fixed" pos="0 0 0"/>
+        </body>
     </worldbody>
 </mujoco>
 """

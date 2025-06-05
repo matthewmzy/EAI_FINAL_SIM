@@ -22,6 +22,9 @@ import open3d as o3d
 import plotly.io as pio
 pio.renderers.default = "browser"
 import plotly.graph_objects as go
+
+CANONICAL_TRANS = np.array([-0.5, -0.25, -0.13])
+
 def plotly_vis_points(points: np.ndarray, title: str = "Point Cloud"):
     """Visualize a point cloud using Plotly."""
     fig = go.Figure(data=[go.Scatter3d(
@@ -46,12 +49,12 @@ def get_workspace_mask(pc: np.ndarray) -> np.ndarray:
     """Get the mask of the point cloud in the workspace."""
     # [0.5,0.3,0.75]
     pc_mask = (
-        (pc[:, 0] > -0.63)
-        & (pc[:, 0] < -0.32)
-        & (pc[:, 1] > -0.045)
-        & (pc[:, 1] < 0.15)
-        & (pc[:, 2] > 0.752)
-        & (pc[:, 2] < 0.85)
+        (pc[:, 0] > 0.3)
+        & (pc[:, 0] < 0.65)
+        & (pc[:, 1] > 0.15)
+        & (pc[:, 1] < 0.5)
+        & (pc[:, 2] > 0.74)
+        & (pc[:, 2] < 0.9)
     )
     return pc_mask
 
@@ -59,6 +62,9 @@ def detect_driller_pose(img, depth, camera_matrix, camera_pose, *args, **kwargs)
     """
     Detects the pose of driller, you can include your policy in args
     """
+
+    # [-0.00126555 -0.04089614  0.62149937] is train data mean translation
+
     # implement the detection logic here
     # 
     H, W = 720, 1280
@@ -87,24 +93,22 @@ def detect_driller_pose(img, depth, camera_matrix, camera_pose, *args, **kwargs)
     np.random.shuffle(points_camera)
     # plotly_vis_points(points_camera[:10000], title="Camera Points")  # 可视化前10000个点
     points_world = np.einsum("ab,nb->na", camera_pose[:3, :3], points_camera) + camera_pose[:3, 3] # (N,3)
-    # plotly_vis_points(points_world[:10000], title="World Points")  # 可视化前10000个点
-    camera_pose = np.linalg.inv(camera_pose)  # (4,4)
-    points_world = np.einsum("ab,nb->na", camera_pose[:3, :3], points_camera) + camera_pose[:3, 3] # (N,3)
-    # plotly_vis_points(points_world[:10000], title="World Points")  # 可视化前10000个点
+    plotly_vis_points(points_world[:10000], title="World Points")  # 可视化前10000个点
+
     points_drill = points_world[get_workspace_mask(points_world)]  # 过滤到工作空间内的点
     # 用open3d fps 降采样到1024个点
-    # pcd = o3d.geometry.PointCloud()
-    # pcd.points = o3d.utility.Vector3dVector(points_drill)
-    # pcd = pcd.farthest_point_down_sample(1024)  # 降采样到1024个点
-    # points_drill = np.asarray(pcd.points)  # (1024, 3)
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points_drill)
+    pcd = pcd.farthest_point_down_sample(1024)  # 降采样到1024个点
+    points_drill = np.asarray(pcd.points)  # (1024, 3)
 
     # 用plotly可视化一下
     # plotly_vis_points(points_drill, title="Drill Points in Workspace")
 
     # open3d 可视化一下points
-    # pcd = o3d.geometry.PointCloud()
-    # pcd.points = o3d.utility.Vector3dVector(points_drill)
-    # o3d.visualization.draw_geometries([pcd])
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points_drill)
+    o3d.visualization.draw_geometries([pcd])
 
     # set_trace()
     config = Config.from_yaml(get_exp_config_from_checkpoint(args[0]))
@@ -112,15 +116,17 @@ def detect_driller_pose(img, depth, camera_matrix, camera_pose, *args, **kwargs)
     model.load_state_dict(torch.load(args[0], map_location='cpu')['model'])
     model.eval().to(args[1])
     
+    canonical_points = points_drill + CANONICAL_TRANS
+
     with torch.no_grad():
         # pred_trans, pred_rot = model.est(points[np.newaxis, ...].astype(np.float32).to(args[1]))
-        pred_trans, pred_rot = model.est(torch.from_numpy(points_drill[np.newaxis, ...]).to(args[1]).float())
+        pred_trans, pred_rot = model.est(torch.from_numpy(canonical_points[np.newaxis, ...]).to(args[1]).float())
         pred_trans = pred_trans[0]
         pred_rot = pred_rot[0]
 
     driller_pose = np.eye(4)
     driller_pose[:3, :3] = pred_rot.cpu().numpy()  # (3,3)
-    driller_pose[:3, 3] = pred_trans.cpu().numpy()  # (3,)
+    driller_pose[:3, 3] = pred_trans.cpu().numpy() - CANONICAL_TRANS  # (3,)
  
     return driller_pose
 
@@ -149,13 +155,9 @@ def detect_marker_pose(
 
 def forward_quad_policy(current_pose, target_pose, *args, **kwargs):
     """根据当前盒子位姿和目标位姿计算四足机器人命令"""
-    # cprint("Calculating quad command...", 'yellow')
     current_trans = current_pose[:3, 3]
     target_trans = target_pose
     direction = target_trans - current_trans
-    # cprint(f"Current trans: {current_trans}", 'yellow')
-    # cprint(f"Target trans: {target_trans}", 'yellow')
-    # cprint(f"Direction: {direction}", 'yellow')
     distance = np.linalg.norm(direction)
     if distance > 0.01:
         velocity = direction / distance * 0.5  # 速度大小为 0.1 m/s
@@ -177,7 +179,7 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
     lift_steps = grasp_config.get('lift_steps', 15)
     squeeze_steps = grasp_config.get('squeeze_steps', 10)
     delta_dist = grasp_config.get('delta_dist', 0.03)
-    print(reach_steps)
+    # print(reach_steps)
     # 获取当前机器人状态
     current_qpos = env.get_state()[:7]
     
@@ -194,7 +196,7 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
             init_qpos=current_qpos,
             retry_times=5
         )
-        print(grasp_arm_qpos)
+        # print(grasp_arm_qpos)
         if not success:
             print("Not Success")
             return None
@@ -280,7 +282,6 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
     # 检查轨迹有效性
     if len(traj_reach) == 0:
         return None
-    set_trace()
     return [np.array(traj_reach), np.array(traj_squeeze), np.array(traj_lift)]
 
 def plan_move(env: WrapperEnv, begin_qpos, begin_trans, begin_rot, end_trans, end_rot, steps = 50, *args, **kwargs):
@@ -384,8 +385,8 @@ def main():
     # env.sim.debug_vis_pose(to_pose(np.array([1,0,0]), np.eye(3)))
     # env.sim.debug_vis_pose(to_pose(np.array([0,1,0]), np.eye(3)))
     # env.sim.debug_vis_pose(to_pose(np.array([0,0,1]), np.eye(3)))
-    env.sim.debug_vis_pose(to_pose(np.array([0.5,0.3,0.75]),
-                                    np.eye(3)), mocap_id='debug_axis_0')   
+    # env.sim.debug_vis_pose(to_pose(np.array([0.5,0.3,0.75]),
+    #                                 np.eye(3)), mocap_id='debug_axis_0')   
 
     runtime_name = time.strftime("%Y%m%d_%H%M%S")
 
@@ -468,15 +469,16 @@ def main():
         obs_wrist = env.get_obs(camera_id=1) # wrist camera
         rgb, depth, camera_pose = obs_wrist.rgb, obs_wrist.depth, obs_wrist.camera_pose
         wrist_camera_matrix = env.sim.humanoid_robot_cfg.camera_cfg[1].intrinsics
-        # driller_pose = detect_driller_pose(rgb, depth,
-        #                                     wrist_camera_matrix,
-        #                                     camera_pose,
-        #                                     args.est_drill_ckpt,
-        #                                     args.device)
-        driller_pose = env.get_driller_pose()
-        print(driller_pose)
+        driller_pose = detect_driller_pose(rgb, depth,
+                                            wrist_camera_matrix,
+                                            camera_pose,
+                                            args.est_drill_ckpt,
+                                            args.device)
+        # driller_pose = env.get_driller_pose()
+        cprint(driller_pose, 'green')
         env.sim.debug_vis_pose(driller_pose, mocap_id='debug_axis_2') 
 
+        set_trace()
         # TODO: ma zhiyuan modified here, assume the driller_pose is detected correctly
         #driller_pose = np.array([[1,0,0,0.5],[0,1,0,0.3],[0,0,1,0.75],[0,0,0,1]])
         
