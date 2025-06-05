@@ -481,6 +481,7 @@ def main():
                                             camera_pose,
                                             args.est_drill_ckpt,
                                             args.device)
+        driller_pose = env.get_driller_pose()
         print(driller_pose)
         print("CCCCC")
         env.sim.debug_vis_pose(driller_pose, mocap_id='debug_axis_2') 
