@@ -561,12 +561,12 @@ def main():
         obs_wrist = env.get_obs(camera_id=1) # wrist camera
         rgb, depth, camera_pose = obs_wrist.rgb, obs_wrist.depth, obs_wrist.camera_pose
         wrist_camera_matrix = env.sim.humanoid_robot_cfg.camera_cfg[1].intrinsics
-        driller_pose = detect_driller_pose(rgb, depth,
-                                            wrist_camera_matrix,
-                                            camera_pose,
-                                            args.est_drill_ckpt,
-                                            args.device)
-        # driller_pose = env.get_driller_pose()
+        # driller_pose = detect_driller_pose(rgb, depth,
+        #                                     wrist_camera_matrix,
+        #                                     camera_pose,
+        #                                     args.est_drill_ckpt,
+        #                                     args.device)
+        driller_pose = env.get_driller_pose()
         cprint(driller_pose, 'green')
         env.sim.debug_vis_pose(driller_pose, mocap_id='debug_axis_2') 
 
@@ -636,7 +636,7 @@ def main():
         # 抬起阶段
         execute_plan(env, lift_plan)
         print("Grasp and lift completed")
-        set_trace()
+        # set_trace()
     # --------------------------------------step 4: plan to move and drop----------------------------------------------------
     if not DISABLE_GRASP and not DISABLE_MOVE:
         # implement your moving plan
