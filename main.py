@@ -478,7 +478,7 @@ def main():
         cprint(driller_pose, 'green')
         env.sim.debug_vis_pose(driller_pose, mocap_id='debug_axis_2') 
 
-        set_trace()
+        # set_trace()
         # TODO: ma zhiyuan modified here, assume the driller_pose is detected correctly
         #driller_pose = np.array([[1,0,0,0.5],[0,1,0,0.3],[0,0,1,0.75],[0,0,0,1]])
         
@@ -544,6 +544,7 @@ def main():
         # 抬起阶段
         execute_plan(env, lift_plan)
         print("Grasp and lift completed")
+        set_trace()
     # --------------------------------------step 4: plan to move and drop----------------------------------------------------
     if not DISABLE_GRASP and not DISABLE_MOVE:
         # implement your moving plan
