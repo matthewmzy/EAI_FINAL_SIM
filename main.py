@@ -728,7 +728,7 @@ def binary_search_xy_coordinate(env, init_qpos, current_start_trans_xy, target_c
 def plan_move(env: WrapperEnv, begin_qpos, begin_trans, begin_rot, end_trans, end_rot, steps = 50, hold_seconds=1, xy_refinement_iterations=5) -> Optional[np.ndarray]:
     """
     规划机械臂从当前位置到投放位置的轨迹。
-    本版本已根据要求，调整了水平移动时 X、Y 坐标的二分查找方式，采用迭代式的同时二分查找，
+    本版本调整了水平移动时 X、Y 坐标的二分查找方式，采用迭代式的同时二分查找，
     以增大时间开销并得到离理想目标更近的结果。
     在水平移动和 Z 轴下降时保持 begin_rot 姿态。
     
