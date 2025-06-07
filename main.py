@@ -202,7 +202,6 @@ def detect_driller_pose(img, depth, camera_matrix, camera_pose, pose_est_method,
  
     return driller_pose
 
-
 def detect_marker_pose(
         detector: Detector,
         img: np.ndarray,
@@ -247,88 +246,219 @@ def backward_quad_policy(pose, target_pose, *args, **kwargs):
 def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> Optional[List[np.ndarray]]:
     """Try to plan a grasp trajectory for the given grasp. The trajectory is a list of joint positions. Return None if the trajectory is not valid."""
 
-    reach_steps = grasp_config.get('reach_steps', 20)
-    lift_steps = grasp_config.get('lift_steps', 15)
+    reach_steps = grasp_config.get('reach_steps', 35)
+    lift_steps = grasp_config.get('lift_steps', 20)
     squeeze_steps = grasp_config.get('squeeze_steps', 10)
-    delta_dist = grasp_config.get('delta_dist', 0.03)
-    # print(reach_steps)
+    approach_steps = grasp_config.get('approach_steps', 20)
+    descent_steps = grasp_config.get('descent_steps', 15)
+    approach_height = grasp_config.get('approach_height', 0.10)
+    max_joint_change = grasp_config.get('max_joint_change', 0.3)
+    
     # 获取当前机器人状态
     current_qpos = env.get_state()[:7]
     
     # 考虑夹爪深度调整抓取位置
-    gripper_depth = 0.01  
+    gripper_depth = 0.012
     adjusted_grasp_trans = grasp.trans - gripper_depth * grasp.rot[:, 0]
     target_rot = grasp.rot
     
+    # 计算两个接近点
+    # 第一个目标点：物体上方指定高度处
+    approach_trans = adjusted_grasp_trans.copy()
+    approach_trans[2] += approach_height
+    
+    # 验证两个目标点的IK可行性
     try:
-        success, grasp_arm_qpos = env.humanoid_robot_model.ik(
-            trans=adjusted_grasp_trans,
+        # 检查上方接近点的IK
+        success_approach, approach_qpos = env.humanoid_robot_model.ik(
+            trans=approach_trans,
             rot=target_rot,
             init_qpos=current_qpos,
             retry_times=5
         )
-        # print(grasp_arm_qpos)
-        if not success:
-            print("Not Success")
+        if not success_approach:
+            print("Approach point IK failed")
+            return None
+            
+        # 检查最终抓取点的IK
+        success_grasp, grasp_arm_qpos = env.humanoid_robot_model.ik(
+            trans=adjusted_grasp_trans,
+            rot=target_rot,
+            init_qpos=approach_qpos,
+            retry_times=5
+        )
+        if not success_grasp:
+            print("Grasp point IK failed")
             return None
     except Exception:
         return None
     
-    # 阶段1: 反向规划接近轨迹
-    approach_trajectory = []
-    cur_trans = adjusted_grasp_trans.copy()
-    cur_rot = target_rot.copy()
-    cur_qpos = grasp_arm_qpos.copy()
+    # 阶段1: 接近物体上方approach_height处
+    traj_reach_approach = []
     
-    # 从抓取位置开始，向后规划接近点
-    valid_approach_points = [grasp_arm_qpos.copy()]  # 抓取位置作为最后一个点
+    # 获取当前末端执行器位姿
+    current_trans, current_rot = env.humanoid_robot_model.fk_eef(current_qpos)
+    joint_distance_approach = np.linalg.norm(approach_qpos - current_qpos)
+    cartesian_distance_approach = np.linalg.norm(approach_trans - current_trans)
     
-    for step in range(reach_steps):
-        # 沿着抓取方向反向移动
-        cur_trans = cur_trans - delta_dist * cur_rot[:, 0]
+    print(f"Approach phase - Joint distance: {joint_distance_approach:.3f}, Cartesian distance: {cartesian_distance_approach:.3f}")
+    print(f"Using {approach_steps} steps for approach phase")
+    
+    if joint_distance_approach > 3.0:  # 关节距离过大的阈值
+        print("Joint distance too large, using multi-stage progressive strategy")
+        
+        # 采用更细粒度的分阶段策略
+        # 将大的关节运动分解为多个小的安全步骤
+        current_stage_qpos = current_qpos.copy()
+        total_stages = max(int(joint_distance_approach / 1.0), 4)  # 至少分4个阶段
+        
+        print(f"Dividing motion into {total_stages} progressive stages")
+        
+        for stage in range(total_stages):
+            # 计算这个阶段的目标关节位置
+            stage_alpha = (stage + 1) / total_stages
+            stage_target_qpos = current_qpos + stage_alpha * (approach_qpos - current_qpos)
+            
+            # 计算这个阶段需要的步数
+            stage_joint_distance = np.linalg.norm(stage_target_qpos - current_stage_qpos)
+            stage_steps = max(int(stage_joint_distance / 0.2) + 5, 8)  # 根据距离计算步数，最少8步
+            
+            print(f"Stage {stage+1}/{total_stages}: Joint distance {stage_joint_distance:.3f}, using {stage_steps} steps")
+            
+            # 生成这个阶段的轨迹
+            for step in range(stage_steps):
+                alpha = (step + 1) / stage_steps
+                # 使用极其平滑的插值
+                smooth_alpha = 10 * alpha**7 - 35 * alpha**6 + 84 * alpha**5 - 70 * alpha**4 + 20 * alpha**3  # 七次平滑插值
+                interpolated_qpos = current_stage_qpos + smooth_alpha * (stage_target_qpos - current_stage_qpos)
+                
+                # 极其严格的关节变化控制
+                if len(traj_reach_approach) > 0:
+                    joint_change = np.linalg.norm(interpolated_qpos - traj_reach_approach[-1])
+                    max_safe_change = max_joint_change * 0.5  # 更严格的限制
+                    
+                    if joint_change > max_safe_change:
+                        # 进一步限制步长
+                        safe_ratio = max_safe_change / joint_change
+                        interpolated_qpos = traj_reach_approach[-1] + safe_ratio * (interpolated_qpos - traj_reach_approach[-1])
+                        print(f"  Step limited: original change {joint_change:.3f} -> safe change {max_safe_change:.3f}")
+                
+                traj_reach_approach.append(interpolated_qpos.copy())
+            
+            # 更新当前阶段位置
+            current_stage_qpos = stage_target_qpos.copy()
+            
+            # 阶段间短暂停顿，增加几个重复点确保稳定
+            for _ in range(3):
+                traj_reach_approach.append(current_stage_qpos.copy())
+        
+        print(f"Multi-stage approach completed with {len(traj_reach_approach)} total steps")
+        
+    elif joint_distance_approach > 1.5 or cartesian_distance_approach > 0.5:
+        # 原有的大运动处理逻辑保持不变
+        print("Large movement to approach point, using conservative interpolation")
+        conservative_steps = max(approach_steps * 2, 40)  # 大运动时增加步数
+        for i in range(conservative_steps):
+            alpha = (i + 1) / conservative_steps
+            smooth_alpha = 3 * alpha**2 - 2 * alpha**3  # 三次平滑插值
+            interpolated_qpos = current_qpos + smooth_alpha * (approach_qpos - current_qpos)
+            traj_reach_approach.append(interpolated_qpos.copy())
+    else:
+        # 原有的笛卡尔空间规划逻辑保持不变
+        print("Using Cartesian space planning for approach")
+        for step in range(approach_steps):
+            alpha = (step + 1) / approach_steps
+            target_trans = current_trans + alpha * (approach_trans - current_trans)
+            
+            # 旋转插值
+            from scipy.spatial.transform import Rotation as R, Slerp
+            key_times = [0, 1]
+            key_rotations = R.from_matrix(np.stack([current_rot, target_rot], axis=0))
+            slerp = Slerp(key_times, key_rotations)
+            r_interp = slerp(alpha)
+            interp_rot = r_interp.as_matrix()
+            
+            try:
+                success, new_qpos = env.humanoid_robot_model.ik(
+                    trans=target_trans,
+                    rot=interp_rot,
+                    init_qpos=current_qpos if step == 0 else traj_reach_approach[-1],
+                    retry_times=3
+                )
+                if success:
+                    # 检查关节变化是否超过限制
+                    prev_qpos = current_qpos if step == 0 else traj_reach_approach[-1]
+                    joint_change = np.linalg.norm(new_qpos - prev_qpos)
+                    if joint_change <= max_joint_change:
+                        traj_reach_approach.append(new_qpos.copy())
+                    else:
+                        print(f"Joint change {joint_change:.3f} exceeds limit {max_joint_change:.3f}, using fallback")
+                        # 使用关节空间插值作为备用
+                        alpha_joint = (step + 1) / approach_steps
+                        interpolated_qpos = current_qpos + alpha_joint * (approach_qpos - current_qpos)
+                        traj_reach_approach.append(interpolated_qpos.copy())
+                else:
+                    # IK失败时使用关节空间插值
+                    alpha_joint = (step + 1) / approach_steps
+                    interpolated_qpos = current_qpos + alpha_joint * (approach_qpos - current_qpos)
+                    traj_reach_approach.append(interpolated_qpos.copy())
+            except Exception:
+                # 异常时使用关节空间插值
+                alpha_joint = (step + 1) / approach_steps
+                interpolated_qpos = current_qpos + alpha_joint * (approach_qpos - current_qpos)
+                traj_reach_approach.append(interpolated_qpos.copy())
+    
+    # 阶段2: 从上方竖直向下接近目标 (保持原有逻辑)
+    traj_reach_descent = []
+    
+    print(f"Descent phase - planning {descent_steps} steps from approach to grasp")
+    
+    # 竖直下降轨迹规划
+    for step in range(descent_steps):
+        alpha = (step + 1) / descent_steps
+        # 只在Z方向插值，保持X,Y位置不变
+        target_trans = approach_trans.copy()
+        target_trans[2] = approach_trans[2] + alpha * (adjusted_grasp_trans[2] - approach_trans[2])
+        
         try:
-            success, cur_qpos = env.sim.humanoid_robot_model.ik(
-                trans=cur_trans,
-                rot=cur_rot,
-                init_qpos=cur_qpos,
+            success, new_qpos = env.humanoid_robot_model.ik(
+                trans=target_trans,
+                rot=target_rot,
+                init_qpos=approach_qpos if step == 0 else traj_reach_descent[-1],
                 retry_times=3
             )
             if success:
-                valid_approach_points.insert(0, cur_qpos.copy())  # 插入到前面
+                # 检查关节变化限制
+                prev_qpos = approach_qpos if step == 0 else traj_reach_descent[-1]
+                joint_change = np.linalg.norm(new_qpos - prev_qpos)
+                if joint_change <= max_joint_change:
+                    traj_reach_descent.append(new_qpos.copy())
+                else:
+                    # 使用更小的步长
+                    alpha_joint = (step + 1) / descent_steps * 0.5  # 减半步长
+                    interpolated_qpos = approach_qpos + alpha_joint * (grasp_arm_qpos - approach_qpos)
+                    traj_reach_descent.append(interpolated_qpos.copy())
             else:
-                break
+                # IK失败时使用关节空间插值
+                alpha_joint = (step + 1) / descent_steps
+                interpolated_qpos = approach_qpos + alpha_joint * (grasp_arm_qpos - approach_qpos)
+                traj_reach_descent.append(interpolated_qpos.copy())
         except Exception:
-            break
+            # 异常时使用关节空间插值
+            alpha_joint = (step + 1) / descent_steps
+            interpolated_qpos = approach_qpos + alpha_joint * (grasp_arm_qpos - approach_qpos)
+            traj_reach_descent.append(interpolated_qpos.copy())
     
-    # 从当前位置连接到第一个接近点
-    traj_reach = []
-    if len(valid_approach_points) > 1:
-        # 从当前位置到第一个接近点
-        first_approach_point = valid_approach_points[0]
-        connection_steps = 20
-        for i in range(connection_steps):
-            alpha = (i + 1) / connection_steps
-            interpolated_qpos = current_qpos + alpha * (first_approach_point - current_qpos)
-            traj_reach.append(interpolated_qpos.copy())
-        
-        # 添加所有接近点
-        traj_reach.extend(valid_approach_points)
-    else:
-        # 如果接近轨迹规划失败，直接从当前位置到抓取位置
-        direct_steps = max(reach_steps, 20)
-        for i in range(direct_steps):
-            alpha = (i + 1) / direct_steps
-            interpolated_qpos = current_qpos + alpha * (grasp_arm_qpos - current_qpos)
-            traj_reach.append(interpolated_qpos.copy())
+    # 合并接近轨迹
+    traj_reach = traj_reach_approach + traj_reach_descent
     
-    # 阶段2: 保持位置，夹
+    # 阶段3: 保持位置，夹取 (保持原有逻辑)
     traj_squeeze = []
     for i in range(squeeze_steps):
         traj_squeeze.append(grasp_arm_qpos.copy())
     
-    # 阶段3: 抬起轨迹
+    # 阶段4: 抬起轨迹 (保持原有逻辑)
     traj_lift = []
-
     lift_height = 0.20 
     lift_target_trans = adjusted_grasp_trans.copy()
     lift_target_trans[2] += lift_height
@@ -342,14 +472,22 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
         )
         
         if success:
-            # 如果终点IK成功，使用关节空间插值
             print(f"Lift IK successful, planning {lift_steps} step trajectory")
             for i in range(lift_steps):
                 alpha = (i + 1) / lift_steps
                 interpolated_qpos = grasp_arm_qpos + alpha * (lift_end_qpos - grasp_arm_qpos)
-                traj_lift.append(interpolated_qpos.copy())
+                
+                # 检查关节变化限制
+                prev_qpos = grasp_arm_qpos if i == 0 else traj_lift[-1]
+                joint_change = np.linalg.norm(interpolated_qpos - prev_qpos)
+                if joint_change <= max_joint_change:
+                    traj_lift.append(interpolated_qpos.copy())
+                else:
+                    # 使用更小的步长
+                    safe_alpha = min(alpha, alpha * (max_joint_change / joint_change))
+                    safe_qpos = grasp_arm_qpos + safe_alpha * (lift_end_qpos - grasp_arm_qpos)
+                    traj_lift.append(safe_qpos.copy())
         else:
-            # 如果终点IK失败，使用笛卡尔空间逐步规划
             print("Lift end IK failed, using incremental planning")
             cur_trans = adjusted_grasp_trans.copy()
             cur_qpos = grasp_arm_qpos.copy()
@@ -365,83 +503,81 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
                         retry_times=3
                     )
                     if success:
-                        cur_qpos = new_qpos.copy()
-                        traj_lift.append(cur_qpos.copy())
-                    else:
-                        # 如果某一步IK失败，使用关节空间插值继续
-                        if len(traj_lift) > 0:
-                            # 基于上一个成功的位置继续插值
-                            prev_qpos = traj_lift[-1]
-                            # 简单的向上插值（假设主要是第6个关节负责抬起）
-                            lift_qpos = prev_qpos.copy()
-                            lift_qpos[5] += 0.02  # 调整肩膀pitch关节
-                            traj_lift.append(lift_qpos)
+                        # 检查关节变化限制
+                        joint_change = np.linalg.norm(new_qpos - cur_qpos)
+                        if joint_change <= max_joint_change:
+                            cur_qpos = new_qpos.copy()
+                            traj_lift.append(cur_qpos.copy())
                         else:
-                            # 如果没有成功的点，基于抓取位置简单插值
-                            lift_qpos = grasp_arm_qpos.copy()
-                            lift_qpos[5] += (step + 1) * 0.02
-                            traj_lift.append(lift_qpos)
+                            # 使用渐进式小步移动
+                            direction = new_qpos - cur_qpos
+                            safe_step = direction * (max_joint_change / joint_change)
+                            cur_qpos = cur_qpos + safe_step
+                            traj_lift.append(cur_qpos.copy())
+                    else:
+                        if len(traj_lift) > 0:
+                            prev_qpos = traj_lift[-1]
+                            delta_qpos = (prev_qpos - grasp_arm_qpos) * 0.1
+                            next_qpos = prev_qpos + delta_qpos
+                            traj_lift.append(next_qpos.copy())
+                        else:
+                            traj_lift.append(grasp_arm_qpos.copy())
                 except Exception:
-                    # 异常情况下的备用方案
                     if len(traj_lift) > 0:
                         traj_lift.append(traj_lift[-1].copy())
                     else:
-                        lift_qpos = grasp_arm_qpos.copy()
-                        lift_qpos[5] += (step + 1) * 0.02
-                        traj_lift.append(lift_qpos)
+                        traj_lift.append(grasp_arm_qpos.copy())
                         
     except Exception as e:
         print(f"Lift planning exception: {e}")
-        print("Using fallback lift strategy - simple upward movement")
+        print("Using fallback lift strategy")
         
-        # 备用方案：在笛卡尔空间中简单向上移动
         cur_trans = adjusted_grasp_trans.copy()
         cur_qpos = grasp_arm_qpos.copy()
-
         fallback_lift_height = 0.10  
         step_height = fallback_lift_height / lift_steps
         
         for step in range(lift_steps):
             cur_trans[2] += step_height
-            
-            # 尝试IK求解，如果失败就使用线性插值
             try:
                 success, new_qpos = env.humanoid_robot_model.ik(
                     trans=cur_trans,
                     rot=target_rot,
                     init_qpos=cur_qpos,
-                    retry_times=1  
+                    retry_times=1
                 )
                 if success:
-                    cur_qpos = new_qpos.copy()
-                    traj_lift.append(cur_qpos.copy())
+                    joint_change = np.linalg.norm(new_qpos - cur_qpos)
+                    if joint_change <= max_joint_change:
+                        cur_qpos = new_qpos.copy()
+                        traj_lift.append(cur_qpos.copy())
+                    else:
+                        direction = new_qpos - cur_qpos
+                        safe_step = direction * (max_joint_change / joint_change)
+                        cur_qpos = cur_qpos + safe_step
+                        traj_lift.append(cur_qpos.copy())
                 else:
-                    # IK失败时，使用从当前位置的线性插值
                     if len(traj_lift) > 0:
-                        # 基于上一个成功位置进行小幅插值
                         prev_qpos = traj_lift[-1]
-                        # 模拟缓慢抬起
-                        delta_qpos = (prev_qpos - grasp_arm_qpos) * 0.1  
+                        delta_qpos = (prev_qpos - grasp_arm_qpos) * 0.1
                         next_qpos = prev_qpos + delta_qpos
                         traj_lift.append(next_qpos.copy())
                     else:
-                        # 如果还没有成功点，就重复抓取位置（保持静止）
                         traj_lift.append(grasp_arm_qpos.copy())
             except Exception:
-                # 静止不动
                 if len(traj_lift) > 0:
                     traj_lift.append(traj_lift[-1].copy())
                 else:
                     traj_lift.append(grasp_arm_qpos.copy())
     
-    # 如果轨迹太短，补充到指定长度
+    # 确保轨迹长度
     while len(traj_lift) < lift_steps:
         if len(traj_lift) > 0:
             traj_lift.append(traj_lift[-1].copy())
         else:
             traj_lift.append(grasp_arm_qpos.copy())
     
-    print(f"Planned trajectories - Reach: {len(traj_reach)}, Squeeze: {len(traj_squeeze)}, Lift: {len(traj_lift)}")
+    print(f"Planned trajectories - Reach: {len(traj_reach)} (approach: {len(traj_reach_approach)}, descent: {len(traj_reach_descent)}), Squeeze: {len(traj_squeeze)}, Lift: {len(traj_lift)}")
     
     # 检查轨迹有效性
     if len(traj_reach) == 0:
@@ -664,10 +800,13 @@ def main():
         valid_grasps = [grasps[0], grasps0_n, grasps[2], grasps2_n]
         
         grasp_config = dict( 
-            reach_steps=15,      # 接近步数
-            lift_steps=12,       # 抬起步数
-            squeeze_steps=8,     # 夹取步数
-            delta_dist=0.03,     # 每步移动距离（较小，更精确）
+            reach_steps=35,      # 接近步数 (增加5步提高稳定性)
+            lift_steps=20,       # 抬起步数 (增加5步使抬起更平稳)
+            squeeze_steps=10,     # 夹取步数 (保持不变)
+            approach_steps=20,    # 到上方接近点的步数
+            descent_steps=15,     # 竖直下降步数
+            approach_height=0.10, # 上方接近高度 (10cm)
+            max_joint_change=0.3, # 单步最大关节变化
         )
 
         successful_grasp = False
@@ -713,7 +852,7 @@ def main():
         # 抬起阶段
         execute_plan(env, lift_plan)
         print("Grasp and lift completed")
-        set_trace()
+        pdb.set_trace()   
     # --------------------------------------step 4: plan to move and drop----------------------------------------------------
     if not DISABLE_GRASP and not DISABLE_MOVE:
         # implement your moving plan
