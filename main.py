@@ -12,18 +12,17 @@ from src.sim.wrapper_env import WrapperEnvConfig, WrapperEnv
 from src.sim.wrapper_env import get_grasps
 from src.test.load_test import load_test_data
 from termcolor import cprint
-from assignment2_zzh.src.model.est_coord import EstCoordNet
-from assignment2_zzh.src.path import get_exp_config_from_checkpoint
-from assignment2_zzh.src.config import Config
+from PIL import Image
 
 import torch
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
+from ultralytics import YOLO
 
 import open3d as o3d
 import plotly.io as pio
 pio.renderers.default = "browser"
 import plotly.graph_objects as go
-
-CANONICAL_TRANS = np.array([-0.5, -0.25, -0.13])
 
 def plotly_vis_points(points: np.ndarray, title: str = "Point Cloud"):
     """Visualize a point cloud using Plotly."""
@@ -48,27 +47,46 @@ def plotly_vis_points(points: np.ndarray, title: str = "Point Cloud"):
 def get_workspace_mask(pc: np.ndarray) -> np.ndarray:
     """Get the mask of the point cloud in the workspace."""
     # [0.5,0.3,0.75]
+    # pc_mask = (
+    #     (pc[:, 0] > 0.3)
+    #     & (pc[:, 0] < 0.65)
+    #     & (pc[:, 1] > 0.15)
+    #     & (pc[:, 1] < 0.5)
+    #     & (pc[:, 2] > 0.7)
+    #     & (pc[:, 2] < 0.9)
+    # )
     pc_mask = (
-        (pc[:, 0] > 0.3)
-        & (pc[:, 0] < 0.65)
-        & (pc[:, 1] > 0.15)
-        & (pc[:, 1] < 0.5)
-        & (pc[:, 2] > 0.74)
+        (pc[:, 0] > 0.2)
+        & (pc[:, 1] > 0.2)
+        & (pc[:, 2] > 0.5)
         & (pc[:, 2] < 0.9)
     )
     return pc_mask
 
-def detect_driller_pose(img, depth, camera_matrix, camera_pose, *args, **kwargs):
+def detect_driller_pose(img, depth, camera_matrix, camera_pose, pose_est_method, *args, **kwargs):
     """
     Detects the pose of driller, you can include your policy in args
     """
-
-    # [-0.00126555 -0.04089614  0.62149937] is train data mean translation
-
     # implement the detection logic here
-    # 
     H, W = 720, 1280
     
+    # # 保存图像
+    # pil_img = Image.fromarray(img)
+    # pil_img.show()
+
+    # # 加载YOLO模型
+    # set_trace()
+    # model = YOLO("my_own_scripts/yolo11l-seg.pt")
+    # results = model(pil_img)
+
+    # # 加载sam模型
+    # checkpoint = "my_own_scripts/sam2/checkpoints/sam2.1_hiera_large.pt"
+    # model_cfg = "my_own_scripts/sam2/sam2/configs/sam2.1/sam2.1_hiera_l.yaml"
+    # predictor = SAM2ImagePredictor(build_sam2(model_cfg, checkpoint))
+    # with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+    #     predictor.set_image(img)
+    #     masks, _, _ = predictor.predict()
+
     # 调整输入到目标分辨率
     if (img.shape[0], img.shape[1]) != (H, W):
         img = cv2.resize(img, (W, H))
@@ -93,40 +111,94 @@ def detect_driller_pose(img, depth, camera_matrix, camera_pose, *args, **kwargs)
     np.random.shuffle(points_camera)
     # plotly_vis_points(points_camera[:10000], title="Camera Points")  # 可视化前10000个点
     points_world = np.einsum("ab,nb->na", camera_pose[:3, :3], points_camera) + camera_pose[:3, 3] # (N,3)
-    plotly_vis_points(points_world[:10000], title="World Points")  # 可视化前10000个点
+    # plotly_vis_points(points_world[:10000], title="World Points")  # 可视化前10000个点
 
     points_drill = points_world[get_workspace_mask(points_world)]  # 过滤到工作空间内的点
-    # 用open3d fps 降采样到1024个点
+    # 用open3d fps 降采样到4096个点
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points_drill)
-    pcd = pcd.farthest_point_down_sample(1024)  # 降采样到1024个点
-    points_drill = np.asarray(pcd.points)  # (1024, 3)
+    pcd = pcd.farthest_point_down_sample(4096)  # 降采样到4096个点
+    points_drill = np.asarray(pcd.points)  # (4096, 3)
 
     # 用plotly可视化一下
     # plotly_vis_points(points_drill, title="Drill Points in Workspace")
 
     # open3d 可视化一下points
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points_drill)
-    o3d.visualization.draw_geometries([pcd])
+    # pcd = o3d.geometry.PointCloud()
+    # pcd.points = o3d.utility.Vector3dVector(points_drill)
+    # o3d.visualization.draw_geometries([pcd])
 
-    # set_trace()
-    config = Config.from_yaml(get_exp_config_from_checkpoint(args[0]))
-    model = EstCoordNet(config)
-    model.load_state_dict(torch.load(args[0], map_location='cpu')['model'])
-    model.eval().to(args[1])
-    
-    canonical_points = points_drill + CANONICAL_TRANS
+    if pose_est_method == "registration":
+        """ 点云配准 """
+        def preprocess_point_cloud(pcd, voxel_size):
+            """降采样点云并计算法向量和 FPFH 特征"""
+            pcd_down = pcd.voxel_down_sample(voxel_size)
+            pcd_down.estimate_normals(
+                o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=50))
+            pcd_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+                pcd_down, o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 5, max_nn=150))
+            return pcd_down, pcd_fpfh
+        def execute_global_registration(source_down, target_down, source_fpfh, target_fpfh, voxel_size):
+            """执行基于特征的 RANSAC 全局配准"""
+            distance_threshold = voxel_size * 1.5
+            print(f":: RANSAC registration with distance threshold {distance_threshold:.3f}")
+            result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+                source_down, target_down, source_fpfh, target_fpfh, True, distance_threshold,
+                o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+                3,
+                [
+                    o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+                    o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(distance_threshold)
+                ],
+                o3d.pipelines.registration.RANSACConvergenceCriteria(1000000, 0.999)
+            )
+            return result
+        full_pcd = np.load("asset/obj/power_drill/single_pcd.npy")
+        obs_pcd = points_drill
+        voxel_size = 0.003
+        source_pcd = o3d.geometry.PointCloud()
+        source_pcd.points = o3d.utility.Vector3dVector(full_pcd)
+        target_pcd = o3d.geometry.PointCloud()
+        target_pcd.points = o3d.utility.Vector3dVector(obs_pcd)
+        source_down, source_fpfh = preprocess_point_cloud(source_pcd, voxel_size)
+        target_down, target_fpfh = preprocess_point_cloud(target_pcd, voxel_size)
 
-    with torch.no_grad():
-        # pred_trans, pred_rot = model.est(points[np.newaxis, ...].astype(np.float32).to(args[1]))
-        pred_trans, pred_rot = model.est(torch.from_numpy(canonical_points[np.newaxis, ...]).to(args[1]).float())
-        pred_trans = pred_trans[0]
-        pred_rot = pred_rot[0]
+        # 执行全局配准
+        result_ransac = execute_global_registration(source_down, target_down, source_fpfh, target_fpfh, voxel_size)
 
-    driller_pose = np.eye(4)
-    driller_pose[:3, :3] = pred_rot.cpu().numpy()  # (3,3)
-    driller_pose[:3, 3] = pred_trans.cpu().numpy() - CANONICAL_TRANS  # (3,)
+        # 提取变换矩阵
+        driller_pose = result_ransac.transformation
+
+        # 可视化obs_pcd和配准后的full_pcd
+        source_pcd.transform(driller_pose)
+        source_pcd.paint_uniform_color([1, 0, 0])
+        target_pcd.paint_uniform_color([0, 1, 0])
+        o3d.visualization.draw_geometries([source_pcd, target_pcd], window_name="Driller Pose Estimation")
+            
+    else:
+        """ 用作业二估pose """
+        from assignment2_zzh.src.model.est_coord import EstCoordNet
+        from assignment2_zzh.src.path import get_exp_config_from_checkpoint
+        from assignment2_zzh.src.config import Config
+
+        CANONICAL_TRANS = np.array([-0.5, -0.25, -0.13])
+
+        config = Config.from_yaml(get_exp_config_from_checkpoint(args[0]))
+        model = EstCoordNet(config)
+        model.load_state_dict(torch.load(args[0], map_location='cpu')['model'])
+        model.eval().to(args[1])
+        
+        canonical_points = points_drill + CANONICAL_TRANS
+
+        with torch.no_grad():
+            # pred_trans, pred_rot = model.est(points[np.newaxis, ...].astype(np.float32).to(args[1]))
+            pred_trans, pred_rot = model.est(torch.from_numpy(canonical_points[np.newaxis, ...]).to(args[1]).float())
+            pred_trans = pred_trans[0]
+            pred_rot = pred_rot[0]
+
+        driller_pose = np.eye(4)
+        driller_pose[:3, :3] = pred_rot.cpu().numpy()  # (3,3)
+        driller_pose[:3, 3] = pred_trans.cpu().numpy() - CANONICAL_TRANS  # (3,)
  
     return driller_pose
 
@@ -184,7 +256,7 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
     current_qpos = env.get_state()[:7]
     
     # 考虑夹爪深度调整抓取位置
-    gripper_depth = 0.02  
+    gripper_depth = 0.01  
     adjusted_grasp_trans = grasp.trans - gripper_depth * grasp.rot[:, 0]
     target_rot = grasp.rot
     
@@ -422,7 +494,9 @@ def main():
     parser.add_argument("--reset_wait_steps", type=int, default=100)
     parser.add_argument("--test_id", type=int, default=0)
     parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--pose_est_method", type=str, default="registration", choices=["registration", "pointnet", "gt"])
     parser.add_argument("--est_drill_ckpt", type=str, default="assignment2_zzh/exps/exp2/checkpoint/checkpoint_15000.pth")
+
 
     args = parser.parse_args()
 
@@ -468,7 +542,7 @@ def main():
 
     env.step_env(humanoid_head_qpos=head_init_qpos)
     
-    observing_qpos = humanoid_init_qpos + np.array([0.01,0,0,0,0,0,0]) # you can customize observing qpos to get wrist obs
+    observing_qpos = humanoid_init_qpos + np.array([0.,-0.3,-0.1,0.5,0.2,0.1,-0.5]) # you can customize observing qpos to get wrist obs
     init_plan = plan_move_qpos(humanoid_init_qpos, observing_qpos, steps = 20)
     execute_plan(env, init_plan)
 
@@ -497,7 +571,7 @@ def main():
             distance = np.linalg.norm(current_pose[:2] - target_pose[:2])
             return distance < threshold
 
-        for step in range(forward_steps):
+        for step in range(forward_steps): # forward_steps
             if step % steps_per_camera_shot == 0:
                 obs_head = env.get_obs(camera_id=0)
                 # env.debug_save_obs(obs_head, runtime_name=runtime_name, step=step)  # Save head camera observation, DEBUG
@@ -561,16 +635,19 @@ def main():
         obs_wrist = env.get_obs(camera_id=1) # wrist camera
         rgb, depth, camera_pose = obs_wrist.rgb, obs_wrist.depth, obs_wrist.camera_pose
         wrist_camera_matrix = env.sim.humanoid_robot_cfg.camera_cfg[1].intrinsics
-        # driller_pose = detect_driller_pose(rgb, depth,
-        #                                     wrist_camera_matrix,
-        #                                     camera_pose,
-        #                                     args.est_drill_ckpt,
-        #                                     args.device)
-        driller_pose = env.get_driller_pose()
+        if args.pose_est_method == 'gt':
+            driller_pose = env.get_driller_pose()
+        else:
+            driller_pose = detect_driller_pose(rgb, depth,
+                                                wrist_camera_matrix,
+                                                camera_pose,
+                                                args.pose_est_method,
+                                                args.est_drill_ckpt,
+                                                args.device)
+            cprint(driller_pose-env.get_driller_pose(), 'cyan')
         cprint(driller_pose, 'green')
         env.sim.debug_vis_pose(driller_pose, mocap_id='debug_axis_2') 
 
-        # set_trace()
         # TODO: ma zhiyuan modified here, assume the driller_pose is detected correctly
         #driller_pose = np.array([[1,0,0,0.5],[0,1,0,0.3],[0,0,1,0.75],[0,0,0,1]])
         
@@ -636,7 +713,7 @@ def main():
         # 抬起阶段
         execute_plan(env, lift_plan)
         print("Grasp and lift completed")
-        # set_trace()
+        set_trace()
     # --------------------------------------step 4: plan to move and drop----------------------------------------------------
     if not DISABLE_GRASP and not DISABLE_MOVE:
         # implement your moving plan
