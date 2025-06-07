@@ -5,6 +5,7 @@ import cv2
 import time
 from pyapriltags import Detector
 from ipdb import set_trace
+from scipy.spatial.transform import Rotation as R
 
 from src.type import Grasp
 from src.utils import to_pose
@@ -114,19 +115,34 @@ def detect_driller_pose(img, depth, camera_matrix, camera_pose, pose_est_method,
     # plotly_vis_points(points_world[:10000], title="World Points")  # 可视化前10000个点
 
     points_drill = points_world[get_workspace_mask(points_world)]  # 过滤到工作空间内的点
-    # 用open3d fps 降采样到4096个点
+
+    # 使用RANSAC进行平面分割以移除桌面点
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points_drill)
-    pcd = pcd.farthest_point_down_sample(4096)  # 降采样到4096个点
-    points_drill = np.asarray(pcd.points)  # (4096, 3)
+    
+    # 使用RANSAC检测桌面平面
+    plane_model, inliers = pcd.segment_plane(distance_threshold=0.01,  # 平面最大距离阈值（根据噪声调整）
+                                            ransac_n=3,             # 拟合平面所需的最少点数
+                                            num_iterations=1000)    # RANSAC迭代次数
+    
+    # 提取非平面点（即物体点）
+    outlier_cloud = pcd.select_by_index(inliers, invert=True)
+    points_drill = np.asarray(outlier_cloud.points)  # (M, 3)，钻头的点云
+    
+    # 可选：如果需要，进一步降采样物体点
+    if len(points_drill) > 8192:
+        pcd_object = o3d.geometry.PointCloud()
+        pcd_object.points = o3d.utility.Vector3dVector(points_drill)
+        pcd_object = pcd_object.farthest_point_down_sample(8192)
+        points_drill = np.asarray(pcd_object.points)  # (8192, 3)
 
     # 用plotly可视化一下
     # plotly_vis_points(points_drill, title="Drill Points in Workspace")
 
     # open3d 可视化一下points
-    # pcd = o3d.geometry.PointCloud()
-    # pcd.points = o3d.utility.Vector3dVector(points_drill)
-    # o3d.visualization.draw_geometries([pcd])
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points_drill)
+    o3d.visualization.draw_geometries([pcd])
 
     if pose_est_method == "registration":
         """ 点云配准 """
@@ -459,7 +475,7 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
     
     # 阶段4: 抬起轨迹 (保持原有逻辑)
     traj_lift = []
-    lift_height = 0.20 
+    lift_height = 0.30 # 稍微增大避免磕桌子
     lift_target_trans = adjusted_grasp_trans.copy()
     lift_target_trans[2] += lift_height
     
@@ -584,14 +600,220 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
         return None
     return [np.array(traj_reach), np.array(traj_squeeze), np.array(traj_lift)]
 
-def plan_move(env: WrapperEnv, begin_qpos, begin_trans, begin_rot, end_trans, end_rot, steps = 50, *args, **kwargs):
-    """Plan a trajectory moving the driller from table to dropping position"""
-    # implement
-    traj = []
+def binary_search_xy_coordinate(env, init_qpos, current_fixed_point_xy, target_coord_val, fixed_coord_val_other_xy, fixed_z_height, fixed_rot, coord_idx, max_iter=25, ik_retries=20, min_progress_alpha_threshold=0.05):
+    """
+    在给定固定 Z 高度、固定另一轴 XY 坐标和固定旋转姿态的情况下，
+    沿单一直线坐标（X 或 Y）执行二分查找，以找到最远的可达点。
 
-    succ = False
-    if not succ: return None
-    return traj
+    参数:
+        env: 仿真环境实例。
+        init_qpos: IK 求解器的起始关节配置。
+        current_fixed_point_xy: 当前 XY 固定点，例如 [x_start, y_start]。
+                                 二分查找将从这个点的 `coord_idx` 轴开始向 `target_coord_val` 搜索。
+        target_coord_val: 目标坐标值（例如，end_trans[0] 用于 X）。
+        fixed_coord_val_other_xy: 另一个 XY 坐标的固定值（例如，如果搜索 X，则为固定的 Y 值）。
+        fixed_z_height: IK 尝试时固定的 Z 高度。
+        fixed_rot: IK 尝试时固定的旋转矩阵。
+        coord_idx: 0 表示 X 坐标搜索，1 表示 Y 坐标搜索。
+        max_iter: 二分查找的最大迭代次数。
+        ik_retries: 每次 IK 调用尝试的重试次数。
+        min_progress_alpha_threshold: 最小的 alpha 进度阈值。如果找到的最佳 alpha 小于此值，
+                                      则认为没有足够有意义的移动，返回 None, None。
+                                      例如，0.05 表示至少需要移动目标距离的 5%。
+
+    返回:
+        tuple: (最终可达的坐标值, 最佳关节位置) 如果成功，否则 (None, None)。
+    """
+    start_val = current_fixed_point_xy[coord_idx] # 获取当前搜索坐标的起始值
+    
+    low_alpha = 0.0
+    high_alpha = 1.0
+    best_alpha = 0.0
+    best_qpos = None
+    
+    cprint(f"    [二分查找 {['X','Y'][coord_idx]}轴] 从 {start_val:.3f} 开始，目标 {target_coord_val:.3f} "
+           f"(固定 {'Y' if coord_idx==0 else 'X'} 在 {fixed_coord_val_other_xy:.3f}, Z 在 {fixed_z_height:.3f})", 'yellow')
+
+    # 构建 IK 尝试时的目标平移向量模板
+    target_trans_template = np.array([0.0, 0.0, fixed_z_height])
+    if coord_idx == 0: # 搜索 X 轴，则 Y 轴固定
+        target_trans_template[1] = fixed_coord_val_other_xy
+    else: # 搜索 Y 轴，则 X 轴固定
+        target_trans_template[0] = fixed_coord_val_other_xy
+
+    # 在二分查找开始前，先尝试起点是否可达。如果起点都不可达，则直接返回失败。
+    initial_test_trans = target_trans_template.copy()
+    initial_test_trans[coord_idx] = start_val
+    try:
+        success_initial, qpos_initial = env.humanoid_robot_model.ik(
+            trans=initial_test_trans,
+            rot=fixed_rot,
+            init_qpos=init_qpos,
+            retry_times=ik_retries
+        )
+        if success_initial:
+            best_alpha = 0.0 # 确保起点是可达的，作为最小可达点
+            best_qpos = qpos_initial.copy()
+        else:
+            cprint(f"    [二分查找 {['X','Y'][coord_idx]}轴] 错误：起始点 {initial_test_trans} 自身不可达！", 'red')
+            return None, None # 起点都不可达，直接失败
+    except Exception as e:
+        cprint(f"    [二分查找 {['X','Y'][coord_idx]}轴] 错误：起点 IK 过程发生异常: {e}。", 'red')
+        return None, None
+
+    for i in range(max_iter):
+        mid_alpha = (low_alpha + high_alpha) / 2.0
+        
+        # 如果 low_alpha 和 high_alpha 已经足够接近，可以提前终止
+        if high_alpha - low_alpha < 0.01: # 例如，搜索精度达到 1%
+            cprint(f"    [二分查找 {['X','Y'][coord_idx]}轴] 迭代 {i+1}: 搜索收敛，精度达到 {high_alpha - low_alpha:.4f}。", 'blue')
+            break
+            
+        # 计算当前测试的坐标值
+        test_coord_val = start_val + mid_alpha * (target_coord_val - start_val)
+        
+        # 构造完整的 3D 目标平移向量
+        test_trans = target_trans_template.copy()
+        test_trans[coord_idx] = test_coord_val # 更新当前搜索的坐标值
+
+        try:
+            success, qpos_test = env.humanoid_robot_model.ik(
+                trans=test_trans,
+                rot=fixed_rot, # 使用固定的旋转姿态
+                init_qpos=best_qpos, # 使用当前找到的最佳 qpos 作为 IK 初始猜测，提高稳定性
+                retry_times=ik_retries
+            )
+            if success:
+                best_alpha = mid_alpha
+                best_qpos = qpos_test.copy()
+                low_alpha = mid_alpha
+                cprint(f"      迭代 {i+1}: 测试 {['X','Y'][coord_idx]}={test_coord_val:.3f} 成功。尝试更远。", 'green')
+            else:
+                high_alpha = mid_alpha
+                cprint(f"      迭代 {i+1}: 测试 {['X','Y'][coord_idx]}={test_coord_val:.3f} 失败。尝试更近。", 'red')
+        except Exception as e:
+            cprint(f"      迭代 {i+1}: IK 过程发生异常，测试 {['X','Y'][coord_idx]}={test_coord_val:.3f} 失败: {e}。", 'red')
+            high_alpha = mid_alpha # 视为失败，缩小范围
+            
+    # 最终检查找到的最佳 alpha 是否达到了最小进度阈值
+    if best_alpha < min_progress_alpha_threshold:
+        cprint(f"    [二分查找 {['X','Y'][coord_idx]}轴] 找到的最佳可达 alpha ({best_alpha:.3f}) 低于最小进度阈值 ({min_progress_alpha_threshold:.3f})。认为没有足够的有意义移动。", 'red')
+        return None, None
+        
+    final_reachable_coord_val = start_val + best_alpha * (target_coord_val - start_val)
+    cprint(f"    [二分查找 {['X','Y'][coord_idx]}轴] 最佳可达 {['X','Y'][coord_idx]}: {final_reachable_coord_val:.3f} (alpha={best_alpha:.3f})", 'blue')
+    return final_reachable_coord_val, best_qpos
+
+
+def plan_move(env: WrapperEnv, begin_qpos, begin_trans, begin_rot, end_trans, end_rot, steps = 50, hold_seconds = 0.5, *args, **kwargs) -> Optional[np.ndarray]:
+    """
+    规划机械臂从当前位置到目标 XY 位置的轨迹，保持 Z 高度和 begin_rot 姿态。
+    本版本包含对 X、Y 坐标的顺序二分查找，并移除 Z 轴下降和最终下降段。
+    
+    参数:
+        env: WrapperEnv 仿真环境实例。
+        begin_qpos: 机械臂当前关节位置 (np.ndarray)。
+        begin_trans: 机械臂末端执行器当前世界坐标系平移 (np.ndarray)。
+        begin_rot: 机械臂末端执行器当前世界坐标系旋转矩阵 (np.ndarray)。
+        end_trans: 目标投放点世界坐标系平移 (np.ndarray)。
+        end_rot: (此版本中 end_rot 不再直接用于最终姿态，仅作为函数签名保留，
+                   因为不再有下降阶段。机械臂将停留在 begin_rot 姿态。)
+        steps: 整个移动阶段的总步数 (int)。
+    
+    返回:
+        Optional[np.ndarray]: 轨迹，为一系列关节位置的 NumPy 数组，如果规划失败则为 None。
+    """
+    traj = []
+    
+    # 初始设置
+    current_qpos_for_next_phase = begin_qpos.copy()
+    fixed_transit_z_height = begin_trans[2] # 水平移动时维持此 Z 高度
+    
+    # --- Phase 1: 沿 X 轴的水平移动规划（二分查找） ---
+    # 保持 Y 轴在 begin_trans[1]，Z 轴在 fixed_transit_z_height，旋转姿态在 begin_rot。
+    cprint("\n--- Phase 1: 规划沿 X 轴的水平移动 (保持 begin_rot) ---", 'blue')
+    
+    # 设置 X 轴二分查找的最小进度阈值，例如 0.05 (5% 的目标距离)
+    x_min_progress_alpha = 0.05 
+    
+    found_x_target, qpos_after_x_move = binary_search_xy_coordinate(
+        env=env,
+        init_qpos=current_qpos_for_next_phase,
+        current_fixed_point_xy=begin_trans[0:2], # 传入当前 XY 坐标作为 X 轴搜索的起点
+        target_coord_val=end_trans[0],
+        fixed_coord_val_other_xy=begin_trans[1], # Y 轴固定为起始 Y 值
+        fixed_z_height=fixed_transit_z_height,
+        fixed_rot=begin_rot, # 使用 begin_rot 作为固定旋转
+        coord_idx=0, # 搜索 X 轴
+        min_progress_alpha_threshold=x_min_progress_alpha
+    )
+
+    if qpos_after_x_move is None:
+        cprint("[PLAN_MOVE] 未能找到可达的 X 坐标，或移动距离不足。规划停止。", 'red')
+        return None
+
+    # 将总步数分为两段，X 轴移动和 Y 轴移动
+    steps_phase1 = max(10, steps // 2) 
+    traj_phase1 = plan_move_qpos(current_qpos_for_next_phase, qpos_after_x_move, steps=steps_phase1)
+    traj.extend(traj_phase1)
+    current_qpos_for_next_phase = qpos_after_x_move.copy() # 更新当前关节位置
+    
+    # --- Phase 2: 沿 Y 轴的水平移动规划（二分查找） ---
+    # 保持 X 轴在 found_x_target，Z 轴在 fixed_transit_z_height，旋转姿态在 begin_rot。
+    cprint("\n--- Phase 2: 规划沿 Y 轴的水平移动 (保持 begin_rot) ---", 'blue')
+    
+    # 构造 Y 轴搜索的起始 XY 坐标。X 轴已移动到 found_x_target，Y 轴仍是初始 Y。
+    # Y 轴二分查找的起始点是 (found_x_target, begin_trans[1])
+    current_xy_for_y_search = np.array([found_x_target, begin_trans[1]])
+
+    # 设置 Y 轴二分查找的最小进度阈值，例如 0.05 (5% 的目标距离)
+    y_min_progress_alpha = 0.05 
+
+    found_y_target, qpos_after_y_move = binary_search_xy_coordinate(
+        env=env,
+        init_qpos=current_qpos_for_next_phase, # 使用 X 轴移动后的关节位置作为起始
+        current_fixed_point_xy=current_xy_for_y_search, # 传入当前 XY 坐标作为 Y 轴搜索的起点
+        target_coord_val=end_trans[1],
+        fixed_coord_val_other_xy=found_x_target, # X 轴在此阶段固定为已找到的 X 值
+        fixed_z_height=fixed_transit_z_height,
+        fixed_rot=begin_rot, # 继续使用 begin_rot 作为固定旋转
+        coord_idx=1, # 搜索 Y 轴
+        min_progress_alpha_threshold=y_min_progress_alpha
+    )
+
+    if qpos_after_y_move is None:
+        cprint("[PLAN_MOVE] 未能找到可达的 Y 坐标，或移动距离不足。规划停止。", 'red')
+        return None
+
+    steps_phase2 = steps - steps_phase1 # 将剩余步数分配给 Y 轴移动
+    if steps_phase2 <= 0: steps_phase2 = 10 # 确保至少有最小步数
+    traj_phase2 = plan_move_qpos(current_qpos_for_next_phase, qpos_after_y_move, steps=steps_phase2)
+    traj.extend(traj_phase2)
+    
+    # --- Phase 3: 保持稳定阶段 ---
+    # 在完成所有移动后，保持最终姿态一段时间，让机械臂稳定。
+    if hold_seconds > 0:
+        sim_dt = 0.02 # 假设环境步长，如果 env.dt 可用，请使用 env.dt
+        try:
+            # 尝试从环境中获取实际的步长
+            sim_dt = env.config.ctrl_dt
+        except Exception:
+            cprint("无法从 env 获取 sim.dt，将使用默认 DEFAULT_SIM_DT。", 'yellow')
+
+        hold_steps = max(1, int(hold_seconds / sim_dt)) # 确保至少 1 步
+        cprint(f"\n--- Phase 3: 增加 {hold_seconds:.2f} 秒 ({hold_steps} 步) 稳定等待时间 ---", 'blue')
+        # 将最后的关节位置重复 hold_steps 次，实现保持效果
+        for _ in range(hold_steps):
+            traj.append(current_qpos_for_next_phase)
+
+    # 最终检查生成的轨迹是否为空
+    if not traj:
+        cprint("[PLAN_MOVE] 生成的轨迹为空。规划存在问题。", 'red')
+        return None
+        
+    cprint(f"[PLAN_MOVE] 成功规划总移动轨迹，共 {len(traj)} 步。机械臂停留在 (X:{found_x_target:.3f}, Y:{found_y_target:.3f}, Z:{fixed_transit_z_height:.3f}) 处，姿态为 begin_rot。", 'green')
+    return np.array(traj)
+
 
 def open_gripper(env: WrapperEnv, steps = 10):
     for _ in range(steps):
@@ -852,16 +1074,68 @@ def main():
         # 抬起阶段
         execute_plan(env, lift_plan)
         print("Grasp and lift completed")
-        pdb.set_trace()   
+        # set_trace()   
     # --------------------------------------step 4: plan to move and drop----------------------------------------------------
     if not DISABLE_GRASP and not DISABLE_MOVE:
-        # implement your moving plan
-        #
+        cprint("\n--- Starting Step 4: Plan to move and drop ---", 'yellow')
+
+        # 获取机械臂当前末端执行器姿态（抓取并抬起后的姿态）
+        # 'lift_plan' 是在 step 3 中生成的，其最后一个点就是机械臂抓取并抬起后的位置
+        if grasp_plan is None or not lift_plan.shape[0] > 0:
+            cprint("[ERROR] Grasp or lift plan is not valid. Cannot proceed to drop.", 'red')
+            env.close()
+            return
+            
+        current_arm_qpos = lift_plan[-1]
+        current_eef_trans, current_eef_rot = env.humanoid_robot_model.fk_eef(current_arm_qpos)
+        cprint(f"Current EEF (End Effector) pose after lift: Trans={current_eef_trans}, Rot={current_eef_rot}", 'cyan')
+
+        # 确定放置目标姿态
+        # trans_container_world 和 rot_container_world 是在 step 1 中获得的容器姿态
+        if 'trans_container_world' not in locals() or trans_container_world is None:
+            cprint("[ERROR] Container pose (trans_container_world) not detected in Step 1. Cannot plan drop.", 'red')
+            env.close()
+            return
+            
+        drop_height_above_container = 0  # 理想情况是容器上方0cm
+        drop_target_trans = trans_container_world.copy()
+        drop_target_trans[2] += drop_height_above_container # 增加Z轴高度
+
+        # 放置时的旋转：可以保持当前抓取姿态的旋转，也可以设定一个固定的垂直姿态
+        # 例如，如果希望物体垂直掉落，可以设置为单位矩阵（如果钻头主轴与Z轴对齐）
+        # 这里先保持抓取时的旋转
+        drop_target_rot = current_eef_rot.copy()
+        # 如果需要特定放置方向，可以这样修改：
+        # drop_target_rot = R.from_euler('xyz', [0, 0, 0], degrees=True).as_matrix() # 使其正面朝前
+        
+        cprint(f"Drop target pose: Trans={drop_target_trans}, Rot={drop_target_rot}", 'cyan')
+        # 可视化放置目标点
+        env.sim.debug_vis_pose(to_pose(drop_target_trans, drop_target_rot), mocap_id='debug_axis_3')
+
+        # 规划移动轨迹
+        move_plan_total_steps = 100  # 根据需求调整总步数
         move_plan = plan_move(
             env=env,
+            begin_qpos=current_arm_qpos,
+            begin_trans=current_eef_trans,
+            begin_rot=current_eef_rot,
+            end_trans=drop_target_trans,
+            end_rot=drop_target_rot,
+            steps=move_plan_total_steps,
+            hold_seconds=0.5
         ) 
+        
+        if move_plan is None:
+            cprint("[ERROR] Failed to plan move to drop position. Simulation halted.", 'red')
+            env.close()
+            return
+
+        cprint("Executing move to drop position...", 'green')
         execute_plan(env, move_plan)
-        open_gripper(env)
+        
+        cprint("Opening gripper to drop object...", 'green')
+        open_gripper(env, steps=15) # 增加步数，确保夹爪完全打开
+        cprint("Drop completed.", 'green')
 
 
     # --------------------------------------step 5: move quadruped backward to initial position------------------------------
