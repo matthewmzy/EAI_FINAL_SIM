@@ -258,10 +258,55 @@ def forward_quad_policy(current_pose, target_pose, *args, **kwargs):
     action = np.array([-velocity[0], -velocity[1], 0])  # xy 平面速度，角速度为 0, 机器狗头朝-x所以加个负号
     return action
 
-def backward_quad_policy(pose, target_pose, *args, **kwargs):
-    """ guide the quadruped back to its initial position """
-    # implement
-    action = np.array([0,0,0])
+def backward_quad_policy(current_quad_base_pose, initial_quad_base_pos, *args, **kwargs):
+    """ 
+    根据当前四足机器狗的基座位姿和目标初始位姿，计算倒退行动命令。
+    此策略与 forward_quad_policy 逻辑类似，通过计算世界坐标系下的目标方向，
+    并将其转换为机器狗局部坐标系下的速度指令。
+    
+    参数:
+        current_quad_base_pose (np.ndarray): 机器狗当前在世界坐标系下的4x4齐次变换矩阵。
+        initial_quad_base_pos (np.ndarray): 机器狗的初始重置位置（通常是 [x, y, z] 数组）。
+    
+    返回:
+        np.ndarray: 四足机器狗的行动命令 [vx, vy, vz_rot]，其中 vz_rot 固定为 0。
+    """
+    # 提取机器狗当前在世界坐标系中的平移部分 (x, y, z)
+    current_trans = current_quad_base_pose[:3, 3] 
+    
+    # 目标平移部分 (x, y, z)
+    target_trans = initial_quad_base_pos 
+
+    # 计算从当前位置到目标初始位置的方向向量
+    direction = target_trans - current_trans
+    
+    # 计算2D平面上的距离（忽略Z轴，因为我们主要关心水平移动）
+    distance_xy = np.linalg.norm(direction[:2]) # 只考虑XY平面距离
+
+    speed = 0.5  # m/s，机器狗的线速度，与前进策略保持一致，确保平稳。
+    angular_speed = 0.0 # 暂不考虑旋转，保持机器狗方向不变，专注于倒退。
+
+    # 如果机器狗已经非常接近目标位置，则停止运动，避免来回抖动。
+    if distance_xy < 0.01: # 设置停止阈值
+        velocity_world = np.array([0.0, 0.0, 0.0])
+        cprint(f"已接近初始位置，距离: {distance_xy:.3f}m。停止运动！", 'green')
+    else:
+        # 计算在世界坐标系中的期望线速度向量
+        # 这里的 direction 是从 current_trans 指向 target_trans
+        velocity_world = direction / distance_xy * speed 
+        
+        # 将世界坐标系下的速度转换为机器狗的局部坐标系指令
+        # 鉴于 `forward_quad_policy` 中 "机器狗头朝-x所以加个负号" 的说明，
+        # 我们假设机器狗的 `quad_command[0]` 控制的是其局部X轴方向的运动，
+        # 且其局部X轴与世界-X轴大致对齐。
+        # 因此，若想在世界X轴正方向移动，`quad_command[0]` 需为负值。
+        # 若想在世界X轴负方向移动，`quad_command[0]` 需为正值。
+        # 这里 `velocity_world[0]` 是世界X方向的期望速度。
+        # 对应的 `quad_command[0]` 应是其反向。
+        action = np.array([-velocity_world[0], -velocity_world[1], angular_speed])
+        
+        cprint(f"倒退中... 当前距离目标: {distance_xy:.3f}m, 世界速度: [{velocity_world[0]:.3f}, {velocity_world[1]:.3f}], 机器狗指令: [{action[0]:.3f}, {action[1]:.3f}]", 'blue')
+
     return action
 
 def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> Optional[List[np.ndarray]]:
@@ -480,7 +525,7 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
     
     # 阶段4: 抬起轨迹 (保持原有逻辑)
     traj_lift = []
-    lift_height = 0.30 # 稍微增大避免磕桌子
+    lift_height = 0.20 # 稍微增大避免磕桌子
     lift_target_trans = adjusted_grasp_trans.copy()
     lift_target_trans[2] += lift_height
     
@@ -605,7 +650,7 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
         return None
     return [np.array(traj_reach), np.array(traj_squeeze), np.array(traj_lift)]
 
-def binary_search_xy_coordinate(env, init_qpos, current_fixed_point_xy, target_coord_val, fixed_coord_val_other_xy, fixed_z_height, fixed_rot, coord_idx, max_iter=25, ik_retries=20, min_progress_alpha_threshold=0.05):
+def binary_search_xy_coordinate(env, init_qpos, current_start_trans_xy, target_coord_val, fixed_coord_val_other_xy, fixed_z_height, fixed_rot, coord_idx, max_iter=25, ik_retries=20):
     """
     在给定固定 Z 高度、固定另一轴 XY 坐标和固定旋转姿态的情况下，
     沿单一直线坐标（X 或 Y）执行二分查找，以找到最远的可达点。
@@ -613,8 +658,8 @@ def binary_search_xy_coordinate(env, init_qpos, current_fixed_point_xy, target_c
     参数:
         env: 仿真环境实例。
         init_qpos: IK 求解器的起始关节配置。
-        current_fixed_point_xy: 当前 XY 固定点，例如 [x_start, y_start]。
-                                 二分查找将从这个点的 `coord_idx` 轴开始向 `target_coord_val` 搜索。
+        current_start_trans_xy: 当前 XY 位置 (例如，[x, y])，用于确定当前搜索坐标的起始值。
+                                 例如，如果搜索 X，这将提供起始 X。
         target_coord_val: 目标坐标值（例如，end_trans[0] 用于 X）。
         fixed_coord_val_other_xy: 另一个 XY 坐标的固定值（例如，如果搜索 X，则为固定的 Y 值）。
         fixed_z_height: IK 尝试时固定的 Z 高度。
@@ -622,22 +667,19 @@ def binary_search_xy_coordinate(env, init_qpos, current_fixed_point_xy, target_c
         coord_idx: 0 表示 X 坐标搜索，1 表示 Y 坐标搜索。
         max_iter: 二分查找的最大迭代次数。
         ik_retries: 每次 IK 调用尝试的重试次数。
-        min_progress_alpha_threshold: 最小的 alpha 进度阈值。如果找到的最佳 alpha 小于此值，
-                                      则认为没有足够有意义的移动，返回 None, None。
-                                      例如，0.05 表示至少需要移动目标距离的 5%。
 
     返回:
         tuple: (最终可达的坐标值, 最佳关节位置) 如果成功，否则 (None, None)。
     """
-    start_val = current_fixed_point_xy[coord_idx] # 获取当前搜索坐标的起始值
+    start_val = current_start_trans_xy[coord_idx] # 获取当前搜索坐标的起始值
     
     low_alpha = 0.0
     high_alpha = 1.0
     best_alpha = 0.0
     best_qpos = None
     
-    cprint(f"    [二分查找 {['X','Y'][coord_idx]}轴] 从 {start_val:.3f} 开始，目标 {target_coord_val:.3f} "
-           f"(固定 {'Y' if coord_idx==0 else 'X'} 在 {fixed_coord_val_other_xy:.3f}, Z 在 {fixed_z_height:.3f})", 'yellow')
+    # cprint(f"    [二分查找 {['X','Y'][coord_idx]}轴] 从 {start_val:.3f} 开始，目标 {target_coord_val:.3f} "
+    #        f"(固定 {'Y' if coord_idx==0 else 'X'} 在 {fixed_coord_val_other_xy:.3f}, Z 在 {fixed_z_height:.3f})", 'yellow')
 
     # 构建 IK 尝试时的目标平移向量模板
     target_trans_template = np.array([0.0, 0.0, fixed_z_height])
@@ -646,34 +688,9 @@ def binary_search_xy_coordinate(env, init_qpos, current_fixed_point_xy, target_c
     else: # 搜索 Y 轴，则 X 轴固定
         target_trans_template[0] = fixed_coord_val_other_xy
 
-    # 在二分查找开始前，先尝试起点是否可达。如果起点都不可达，则直接返回失败。
-    initial_test_trans = target_trans_template.copy()
-    initial_test_trans[coord_idx] = start_val
-    try:
-        success_initial, qpos_initial = env.humanoid_robot_model.ik(
-            trans=initial_test_trans,
-            rot=fixed_rot,
-            init_qpos=init_qpos,
-            retry_times=ik_retries
-        )
-        if success_initial:
-            best_alpha = 0.0 # 确保起点是可达的，作为最小可达点
-            best_qpos = qpos_initial.copy()
-        else:
-            cprint(f"    [二分查找 {['X','Y'][coord_idx]}轴] 错误：起始点 {initial_test_trans} 自身不可达！", 'red')
-            return None, None # 起点都不可达，直接失败
-    except Exception as e:
-        cprint(f"    [二分查找 {['X','Y'][coord_idx]}轴] 错误：起点 IK 过程发生异常: {e}。", 'red')
-        return None, None
-
     for i in range(max_iter):
         mid_alpha = (low_alpha + high_alpha) / 2.0
         
-        # 如果 low_alpha 和 high_alpha 已经足够接近，可以提前终止
-        if high_alpha - low_alpha < 0.01: # 例如，搜索精度达到 1%
-            cprint(f"    [二分查找 {['X','Y'][coord_idx]}轴] 迭代 {i+1}: 搜索收敛，精度达到 {high_alpha - low_alpha:.4f}。", 'blue')
-            break
-            
         # 计算当前测试的坐标值
         test_coord_val = start_val + mid_alpha * (target_coord_val - start_val)
         
@@ -685,35 +702,35 @@ def binary_search_xy_coordinate(env, init_qpos, current_fixed_point_xy, target_c
             success, qpos_test = env.humanoid_robot_model.ik(
                 trans=test_trans,
                 rot=fixed_rot, # 使用固定的旋转姿态
-                init_qpos=best_qpos, # 使用当前找到的最佳 qpos 作为 IK 初始猜测，提高稳定性
+                init_qpos=init_qpos,
                 retry_times=ik_retries
             )
             if success:
                 best_alpha = mid_alpha
                 best_qpos = qpos_test.copy()
                 low_alpha = mid_alpha
-                cprint(f"      迭代 {i+1}: 测试 {['X','Y'][coord_idx]}={test_coord_val:.3f} 成功。尝试更远。", 'green')
+                # cprint(f"      迭代 {i+1}: 测试 {['X','Y'][coord_idx]}={test_coord_val:.3f} 成功。尝试更远。", 'green') # 调试输出
             else:
                 high_alpha = mid_alpha
-                cprint(f"      迭代 {i+1}: 测试 {['X','Y'][coord_idx]}={test_coord_val:.3f} 失败。尝试更近。", 'red')
+                # cprint(f"      迭代 {i+1}: 测试 {['X','Y'][coord_idx]}={test_coord_val:.3f} 失败。尝试更近。", 'red') # 调试输出
         except Exception as e:
-            cprint(f"      迭代 {i+1}: IK 过程发生异常，测试 {['X','Y'][coord_idx]}={test_coord_val:.3f} 失败: {e}。", 'red')
-            high_alpha = mid_alpha # 视为失败，缩小范围
+            # cprint(f"      迭代 {i+1}: IK 过程发生异常，测试 {['X','Y'][coord_idx]}={test_coord_val:.3f} 失败: {e}。", 'red') # 调试输出
+            high_alpha = mid_alpha
             
-    # 最终检查找到的最佳 alpha 是否达到了最小进度阈值
-    if best_alpha < min_progress_alpha_threshold:
-        cprint(f"    [二分查找 {['X','Y'][coord_idx]}轴] 找到的最佳可达 alpha ({best_alpha:.3f}) 低于最小进度阈值 ({min_progress_alpha_threshold:.3f})。认为没有足够的有意义移动。", 'red')
+    if best_qpos is None:
+        # cprint(f"    [二分查找 {['X','Y'][coord_idx]}轴] 未能找到任何超出起点的可达点 (alpha=0)。", 'red') # 调试输出
         return None, None
         
     final_reachable_coord_val = start_val + best_alpha * (target_coord_val - start_val)
     cprint(f"    [二分查找 {['X','Y'][coord_idx]}轴] 最佳可达 {['X','Y'][coord_idx]}: {final_reachable_coord_val:.3f} (alpha={best_alpha:.3f})", 'blue')
     return final_reachable_coord_val, best_qpos
 
-
-def plan_move(env: WrapperEnv, begin_qpos, begin_trans, begin_rot, end_trans, end_rot, steps = 50, hold_seconds = 0.5, *args, **kwargs) -> Optional[np.ndarray]:
+def plan_move(env: WrapperEnv, begin_qpos, begin_trans, begin_rot, end_trans, end_rot, steps = 50, hold_seconds=1, xy_refinement_iterations=5) -> Optional[np.ndarray]:
     """
-    规划机械臂从当前位置到目标 XY 位置的轨迹，保持 Z 高度和 begin_rot 姿态。
-    本版本包含对 X、Y 坐标的顺序二分查找，并移除 Z 轴下降和最终下降段。
+    规划机械臂从当前位置到投放位置的轨迹。
+    本版本已根据要求，调整了水平移动时 X、Y 坐标的二分查找方式，采用迭代式的同时二分查找，
+    以增大时间开销并得到离理想目标更近的结果。
+    在水平移动和 Z 轴下降时保持 begin_rot 姿态。
     
     参数:
         env: WrapperEnv 仿真环境实例。
@@ -721,9 +738,10 @@ def plan_move(env: WrapperEnv, begin_qpos, begin_trans, begin_rot, end_trans, en
         begin_trans: 机械臂末端执行器当前世界坐标系平移 (np.ndarray)。
         begin_rot: 机械臂末端执行器当前世界坐标系旋转矩阵 (np.ndarray)。
         end_trans: 目标投放点世界坐标系平移 (np.ndarray)。
-        end_rot: (此版本中 end_rot 不再直接用于最终姿态，仅作为函数签名保留，
-                   因为不再有下降阶段。机械臂将停留在 begin_rot 姿态。)
+        end_rot: 目标投放点世界坐标系旋转矩阵 (np.ndarray)。
         steps: 整个移动阶段的总步数 (int)。
+        hold_seconds: 保持最终位置的秒数。
+        xy_refinement_iterations: 对 XY 坐标进行迭代二分查找的次数，用于提高精度。
     
     返回:
         Optional[np.ndarray]: 轨迹，为一系列关节位置的 NumPy 数组，如果规划失败则为 None。
@@ -731,79 +749,101 @@ def plan_move(env: WrapperEnv, begin_qpos, begin_trans, begin_rot, end_trans, en
     traj = []
     
     # 初始设置
-    current_qpos_for_next_phase = begin_qpos.copy()
-    fixed_transit_z_height = begin_trans[2] # 水平移动时维持此 Z 高度
+    current_qpos_for_ik = begin_qpos.copy()
+    current_eef_z_height = begin_trans[2] # 水平移动时维持此 Z 高度
     
-    # --- Phase 1: 沿 X 轴的水平移动规划（二分查找） ---
-    # 保持 Y 轴在 begin_trans[1]，Z 轴在 fixed_transit_z_height，旋转姿态在 begin_rot。
-    cprint("\n--- Phase 1: 规划沿 X 轴的水平移动 (保持 begin_rot) ---", 'blue')
+    # 用于迭代二分查找的当前可达 XY 坐标
+    current_reachable_x = begin_trans[0]
+    current_reachable_y = begin_trans[1]
     
-    # 设置 X 轴二分查找的最小进度阈值，例如 0.05 (5% 的目标距离)
-    x_min_progress_alpha = 0.05 
+    cprint("\n--- Phase 1 & 2: 迭代规划沿 XY 轴的水平移动 (保持 begin_rot) ---", 'blue')
     
-    found_x_target, qpos_after_x_move = binary_search_xy_coordinate(
-        env=env,
-        init_qpos=current_qpos_for_next_phase,
-        current_fixed_point_xy=begin_trans[0:2], # 传入当前 XY 坐标作为 X 轴搜索的起点
-        target_coord_val=end_trans[0],
-        fixed_coord_val_other_xy=begin_trans[1], # Y 轴固定为起始 Y 值
-        fixed_z_height=fixed_transit_z_height,
-        fixed_rot=begin_rot, # 使用 begin_rot 作为固定旋转
-        coord_idx=0, # 搜索 X 轴
-        min_progress_alpha_threshold=x_min_progress_alpha
-    )
+    # 存储每次迭代的最终关节位置，用于生成轨迹
+    intermediate_qposes = []
 
-    if qpos_after_x_move is None:
-        cprint("[PLAN_MOVE] 未能找到可达的 X 坐标，或移动距离不足。规划停止。", 'red')
+    # 进行多轮迭代二分查找，以同时优化 X 和 Y
+    for iteration in range(xy_refinement_iterations):
+        cprint(f"  --- XY 迭代优化轮次 {iteration + 1}/{xy_refinement_iterations} ---", 'cyan')
+        
+        prev_reachable_x = current_reachable_x
+        prev_reachable_y = current_reachable_y
+
+        # 首先尝试优化 Y 轴
+        cprint(f"    [XY 迭代] 优化 Y 轴. 当前可达 XY: ({current_reachable_x:.3f}, {current_reachable_y:.3f})", 'yellow')
+        found_y_val, qpos_after_y_search = binary_search_xy_coordinate(
+            env=env,
+            init_qpos=current_qpos_for_ik,
+            current_start_trans_xy=np.array([current_reachable_x, current_reachable_y]),
+            target_coord_val=end_trans[1],
+            fixed_coord_val_other_xy=current_reachable_x, # Y 轴搜索时固定当前可达的 X 值
+            fixed_z_height=current_eef_z_height,
+            fixed_rot=begin_rot,
+            coord_idx=1 # 搜索 Y 轴
+        )
+        
+        if qpos_after_y_search is not None:
+            current_reachable_y = found_y_val
+            current_qpos_for_ik = qpos_after_y_search.copy()
+            cprint(f"    [XY 迭代] Y 轴优化结果: Y={current_reachable_y:.3f}", 'green')
+        else:
+            cprint(f"    [XY 迭代] Y 轴优化失败，保持 Y={current_reachable_y:.3f}。可能是初始点就不可达或目标方向不可达。", 'red')
+
+        # 接着尝试优化 X 轴
+        cprint(f"    [XY 迭代] 优化 X 轴. 当前可达 XY: ({current_reachable_x:.3f}, {current_reachable_y:.3f})", 'yellow')
+        found_x_val, qpos_after_x_search = binary_search_xy_coordinate(
+            env=env,
+            init_qpos=current_qpos_for_ik, # 使用 Y 轴搜索后的关节位置作为起始
+            current_start_trans_xy=np.array([current_reachable_x, current_reachable_y]),
+            target_coord_val=end_trans[0],
+            fixed_coord_val_other_xy=current_reachable_y, # X 轴搜索时固定当前可达的 Y 值 (已更新)
+            fixed_z_height=current_eef_z_height,
+            fixed_rot=begin_rot,
+            coord_idx=0 # 搜索 X 轴
+        )
+        
+        if qpos_after_x_search is not None:
+            current_reachable_x = found_x_val
+            current_qpos_for_ik = qpos_after_x_search.copy()
+            cprint(f"    [XY 迭代] X 轴优化结果: X={current_reachable_x:.3f}", 'green')
+        else:
+            cprint(f"    [XY 迭代] X 轴优化失败，保持 X={current_reachable_x:.3f}。可能是初始点就不可达或目标方向不可达。", 'red')
+
+        # 记录本次迭代的最终可达关节位置
+        if current_qpos_for_ik is not None:
+            intermediate_qposes.append(current_qpos_for_ik.copy())
+            
+        # 检查收敛性：如果 X 和 Y 坐标的变化量都非常小，则认为收敛
+        distance_change_x = abs(current_reachable_x - prev_reachable_x)
+        distance_change_y = abs(current_reachable_y - prev_reachable_y)
+        convergence_threshold = 0.001 # 1毫米的阈值
+        
+        if iteration > 0 and distance_change_x < convergence_threshold and distance_change_y < convergence_threshold:
+            cprint(f"  [XY 迭代] X/Y 坐标已收敛 (X 变化: {distance_change_x:.4f}, Y 变化: {distance_change_y:.4f})。", 'green')
+            break
+    
+    # 如果在任何迭代后，仍然没有找到一个有效的关节位置，则规划失败
+    if not intermediate_qposes:
+        cprint("[PLAN_MOVE] 经过 XY 迭代二分查找，未能找到任何可达的关节位置。规划停止。", 'red')
         return None
 
-    # 将总步数分为两段，X 轴移动和 Y 轴移动
-    steps_phase1 = max(10, steps // 2) 
-    traj_phase1 = plan_move_qpos(current_qpos_for_next_phase, qpos_after_x_move, steps=steps_phase1)
-    traj.extend(traj_phase1)
-    current_qpos_for_next_phase = qpos_after_x_move.copy() # 更新当前关节位置
+    # 从 begin_qpos 移动到最终迭代的可达关节位置
+    final_reachable_qpos = intermediate_qposes[-1]
     
-    # --- Phase 2: 沿 Y 轴的水平移动规划（二分查找） ---
-    # 保持 X 轴在 found_x_target，Z 轴在 fixed_transit_z_height，旋转姿态在 begin_rot。
-    cprint("\n--- Phase 2: 规划沿 Y 轴的水平移动 (保持 begin_rot) ---", 'blue')
-    
-    # 构造 Y 轴搜索的起始 XY 坐标。X 轴已移动到 found_x_target，Y 轴仍是初始 Y。
-    # Y 轴二分查找的起始点是 (found_x_target, begin_trans[1])
-    current_xy_for_y_search = np.array([found_x_target, begin_trans[1]])
+    # 计算实际移动到最终可达点的轨迹步数
+    steps_xy_move = max(10, steps // 2) # 分配一半的步数给 XY 移动
+    traj_xy_move = plan_move_qpos(begin_qpos, final_reachable_qpos, steps=steps_xy_move)
+    traj.extend(traj_xy_move)
+    current_qpos_for_next_phase = final_reachable_qpos.copy() # 更新当前关节位置
 
-    # 设置 Y 轴二分查找的最小进度阈值，例如 0.05 (5% 的目标距离)
-    y_min_progress_alpha = 0.05 
-
-    found_y_target, qpos_after_y_move = binary_search_xy_coordinate(
-        env=env,
-        init_qpos=current_qpos_for_next_phase, # 使用 X 轴移动后的关节位置作为起始
-        current_fixed_point_xy=current_xy_for_y_search, # 传入当前 XY 坐标作为 Y 轴搜索的起点
-        target_coord_val=end_trans[1],
-        fixed_coord_val_other_xy=found_x_target, # X 轴在此阶段固定为已找到的 X 值
-        fixed_z_height=fixed_transit_z_height,
-        fixed_rot=begin_rot, # 继续使用 begin_rot 作为固定旋转
-        coord_idx=1, # 搜索 Y 轴
-        min_progress_alpha_threshold=y_min_progress_alpha
-    )
-
-    if qpos_after_y_move is None:
-        cprint("[PLAN_MOVE] 未能找到可达的 Y 坐标，或移动距离不足。规划停止。", 'red')
-        return None
-
-    steps_phase2 = steps - steps_phase1 # 将剩余步数分配给 Y 轴移动
-    if steps_phase2 <= 0: steps_phase2 = 10 # 确保至少有最小步数
-    traj_phase2 = plan_move_qpos(current_qpos_for_next_phase, qpos_after_y_move, steps=steps_phase2)
-    traj.extend(traj_phase2)
-    
     # --- Phase 3: 保持稳定阶段 ---
     # 在完成所有移动后，保持最终姿态一段时间，让机械臂稳定。
     if hold_seconds > 0:
-        sim_dt = 0.02 # 假设环境步长，如果 env.dt 可用，请使用 env.dt
+        sim_dt = 0.02 # 假设环境步长，如果 env.config.ctrl_dt 可用，请使用环境配置
         try:
-            # 尝试从环境中获取实际的步长
+            # 尝试从环境中获取实际的步长，如果环境对象有这个属性的话
             sim_dt = env.config.ctrl_dt
         except Exception:
-            cprint("无法从 env 获取 sim.dt，将使用默认 DEFAULT_SIM_DT。", 'yellow')
+            cprint("无法从 env 获取 ctrl_dt，将使用默认dt。", 'yellow')
 
         hold_steps = max(1, int(hold_seconds / sim_dt)) # 确保至少 1 步
         cprint(f"\n--- Phase 3: 增加 {hold_seconds:.2f} 秒 ({hold_steps} 步) 稳定等待时间 ---", 'blue')
@@ -816,9 +856,8 @@ def plan_move(env: WrapperEnv, begin_qpos, begin_trans, begin_rot, end_trans, en
         cprint("[PLAN_MOVE] 生成的轨迹为空。规划存在问题。", 'red')
         return None
         
-    cprint(f"[PLAN_MOVE] 成功规划总移动轨迹，共 {len(traj)} 步。机械臂停留在 (X:{found_x_target:.3f}, Y:{found_y_target:.3f}, Z:{fixed_transit_z_height:.3f}) 处，姿态为 begin_rot。", 'green')
+    cprint(f"[PLAN_MOVE] 成功规划总移动轨迹，共 {len(traj)} 步。", 'green')
     return np.array(traj)
-
 
 def open_gripper(env: WrapperEnv, steps = 10):
     for _ in range(steps):
@@ -1127,7 +1166,7 @@ def main():
             end_trans=drop_target_trans,
             end_rot=drop_target_rot,
             steps=move_plan_total_steps,
-            hold_seconds=0.5
+            hold_seconds=1
         ) 
         
         if move_plan is None:
@@ -1145,17 +1184,49 @@ def main():
 
     # --------------------------------------step 5: move quadruped backward to initial position------------------------------
     if not DISABLE_MOVE:
-        # implement
-        #
-        backward_steps = 1000 # customize by yourselves
+        cprint("\n--- 开始执行 Step 5: 机器狗倒退回初始位置 ---", 'yellow')
+
+        # 获取机器狗的初始重置位置，作为本次倒退的目标点
+        initial_quad_reset_pos = data_dict['quad_reset_pos']
+        cprint(f"目标初始位置: ({initial_quad_reset_pos[0]:.3f}, {initial_quad_reset_pos[1]:.3f}, {initial_quad_reset_pos[2]:.3f})", 'cyan')
+
+        # 定义一个函数来判断机器狗是否已经足够接近目标位置
+        def is_quad_close_to_initial(current_quad_pose_matrix, target_initial_pos_vector, threshold=0.01): # 阈值设定为1厘米
+            current_pos_xy = current_quad_pose_matrix[:2, 3] # 从4x4位姿矩阵中提取当前的XY坐标
+            target_pos_xy = target_initial_pos_vector[:2] # 从目标向量中提取XY坐标
+            distance = np.linalg.norm(current_pos_xy - target_pos_xy) # 计算欧几里得距离
+            return distance < threshold
+
+        backward_steps = 1000 # 设定最大倒退步数，防止无限循环
+
         for step in range(backward_steps):
-            # same as before, please implement this
-            #
-            quad_command = backward_quad_policy()
-            env.step_env(
-                quad_command=quad_command
-            )
-        
+            # 获取机器狗当前的基座位姿（在世界坐标系中）
+            current_quad_base_pose = env.get_quad_pose() 
+
+            # 检查是否已经到达目标位置附近
+            if is_quad_close_to_initial(current_quad_base_pose, initial_quad_reset_pos):
+                cprint(f"机器狗已成功返回初始位置附近，总共用时 {step} 步。", 'green')
+                # 到达目标后，发送停止命令
+                env.step_env(quad_command=np.array([0.0, 0.0, 0.0]))
+                break # 退出循环
+
+            # 调用我们实现的倒退策略来获取控制命令
+            quad_command = backward_quad_policy(current_quad_base_pose, initial_quad_reset_pos)
+            
+            # 将控制命令应用到仿真环境中
+            env.step_env(quad_command=quad_command)
+            
+            # 为了调试和监控，可以每隔一定步数打印进度
+            if step % 100 == 0: # 每100步打印一次
+                current_quad_pos_xy = current_quad_base_pose[:2, 3]
+                distance_to_target = np.linalg.norm(current_quad_pos_xy - initial_quad_reset_pos[:2])
+                cprint(f"Step {step}/{backward_steps}: 机器狗当前XY: ({current_quad_pos_xy[0]:.3f}, {current_quad_pos_xy[1]:.3f}), 距离初始点: {distance_to_target:.3f}m。", 'blue')
+        else: # 如果循环在达到最大步数时结束，说明未完全回到初始位置
+            cprint(f"警告: 机器狗在 {backward_steps} 步内未能完全返回初始位置。", 'yellow')
+
+        # 更新四足机器狗返回指标
+        Metric["quad_return"] = Metric["quad_return"] or env.metric_quad_return()
+        cprint(f"更新: 四足机器狗返回状态: {Metric['quad_return']}", 'green')
 
     # test the metrics
     Metric["drop_precision"] = Metric["drop_precision"] or env.metric_drop_precision()
