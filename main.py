@@ -114,19 +114,34 @@ def detect_driller_pose(img, depth, camera_matrix, camera_pose, pose_est_method,
     # plotly_vis_points(points_world[:10000], title="World Points")  # 可视化前10000个点
 
     points_drill = points_world[get_workspace_mask(points_world)]  # 过滤到工作空间内的点
-    # 用open3d fps 降采样到4096个点
+
+    # 使用RANSAC进行平面分割以移除桌面点
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points_drill)
-    pcd = pcd.farthest_point_down_sample(4096)  # 降采样到4096个点
-    points_drill = np.asarray(pcd.points)  # (4096, 3)
+    
+    # 使用RANSAC检测桌面平面
+    plane_model, inliers = pcd.segment_plane(distance_threshold=0.01,  # 平面最大距离阈值（根据噪声调整）
+                                            ransac_n=3,             # 拟合平面所需的最少点数
+                                            num_iterations=1000)    # RANSAC迭代次数
+    
+    # 提取非平面点（即物体点）
+    outlier_cloud = pcd.select_by_index(inliers, invert=True)
+    points_drill = np.asarray(outlier_cloud.points)  # (M, 3)，钻头的点云
+    
+    # 可选：如果需要，进一步降采样物体点
+    if len(points_drill) > 2048:
+        pcd_object = o3d.geometry.PointCloud()
+        pcd_object.points = o3d.utility.Vector3dVector(points_drill)
+        pcd_object = pcd_object.farthest_point_down_sample(2048)
+        points_drill = np.asarray(pcd_object.points)  # (2048, 3)
 
     # 用plotly可视化一下
     # plotly_vis_points(points_drill, title="Drill Points in Workspace")
 
     # open3d 可视化一下points
-    # pcd = o3d.geometry.PointCloud()
-    # pcd.points = o3d.utility.Vector3dVector(points_drill)
-    # o3d.visualization.draw_geometries([pcd])
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points_drill)
+    o3d.visualization.draw_geometries([pcd])
 
     if pose_est_method == "registration":
         """ 点云配准 """
@@ -852,7 +867,7 @@ def main():
         # 抬起阶段
         execute_plan(env, lift_plan)
         print("Grasp and lift completed")
-        pdb.set_trace()   
+        set_trace()   
     # --------------------------------------step 4: plan to move and drop----------------------------------------------------
     if not DISABLE_GRASP and not DISABLE_MOVE:
         # implement your moving plan
