@@ -188,7 +188,6 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
     adjusted_grasp_trans = grasp.trans - gripper_depth * grasp.rot[:, 0]
     target_rot = grasp.rot
     
-    # 计算最终抓取位置的逆运动学
     try:
         success, grasp_arm_qpos = env.humanoid_robot_model.ik(
             trans=adjusted_grasp_trans,
@@ -250,34 +249,127 @@ def plan_grasp(env: WrapperEnv, grasp: Grasp, grasp_config, *args, **kwargs) -> 
             interpolated_qpos = current_qpos + alpha * (grasp_arm_qpos - current_qpos)
             traj_reach.append(interpolated_qpos.copy())
     
-    # 阶段2: 夹取轨迹（保持位置，为夹爪控制预留时间）"
+    # 阶段2: 保持位置，夹
     traj_squeeze = []
     for i in range(squeeze_steps):
         traj_squeeze.append(grasp_arm_qpos.copy())
     
-    # 阶段3: 抬起轨迹（参考官方代码的垂直抬起逻辑）
+    # 阶段3: 抬起轨迹
     traj_lift = []
-    cur_trans = adjusted_grasp_trans.copy()
-    cur_rot = target_rot.copy()
-    cur_qpos = grasp_arm_qpos.copy()
+
+    lift_height = 0.20 
+    lift_target_trans = adjusted_grasp_trans.copy()
+    lift_target_trans[2] += lift_height
     
-    for step in range(lift_steps):
-        # 垂直向上抬起
-        cur_trans[2] += delta_dist
-        try:
-            success, cur_qpos = env.sim.humanoid_robot_model.ik(
-                trans=cur_trans,
-                rot=cur_rot,
-                init_qpos=cur_qpos,
-                retry_times=3
-            )
-            if success:
-                traj_lift.append(cur_qpos.copy())
-            else:
-                # 如果IK失败，保持当前位置
-                traj_lift.append(grasp_arm_qpos.copy())
-        except Exception:
+    try:
+        success, lift_end_qpos = env.humanoid_robot_model.ik(
+            trans=lift_target_trans,
+            rot=target_rot,
+            init_qpos=grasp_arm_qpos,
+            retry_times=5
+        )
+        
+        if success:
+            # 如果终点IK成功，使用关节空间插值
+            print(f"Lift IK successful, planning {lift_steps} step trajectory")
+            for i in range(lift_steps):
+                alpha = (i + 1) / lift_steps
+                interpolated_qpos = grasp_arm_qpos + alpha * (lift_end_qpos - grasp_arm_qpos)
+                traj_lift.append(interpolated_qpos.copy())
+        else:
+            # 如果终点IK失败，使用笛卡尔空间逐步规划
+            print("Lift end IK failed, using incremental planning")
+            cur_trans = adjusted_grasp_trans.copy()
+            cur_qpos = grasp_arm_qpos.copy()
+            step_height = lift_height / lift_steps
+            
+            for step in range(lift_steps):
+                cur_trans[2] += step_height
+                try:
+                    success, new_qpos = env.humanoid_robot_model.ik(
+                        trans=cur_trans,
+                        rot=target_rot,
+                        init_qpos=cur_qpos,
+                        retry_times=3
+                    )
+                    if success:
+                        cur_qpos = new_qpos.copy()
+                        traj_lift.append(cur_qpos.copy())
+                    else:
+                        # 如果某一步IK失败，使用关节空间插值继续
+                        if len(traj_lift) > 0:
+                            # 基于上一个成功的位置继续插值
+                            prev_qpos = traj_lift[-1]
+                            # 简单的向上插值（假设主要是第6个关节负责抬起）
+                            lift_qpos = prev_qpos.copy()
+                            lift_qpos[5] += 0.02  # 调整肩膀pitch关节
+                            traj_lift.append(lift_qpos)
+                        else:
+                            # 如果没有成功的点，基于抓取位置简单插值
+                            lift_qpos = grasp_arm_qpos.copy()
+                            lift_qpos[5] += (step + 1) * 0.02
+                            traj_lift.append(lift_qpos)
+                except Exception:
+                    # 异常情况下的备用方案
+                    if len(traj_lift) > 0:
+                        traj_lift.append(traj_lift[-1].copy())
+                    else:
+                        lift_qpos = grasp_arm_qpos.copy()
+                        lift_qpos[5] += (step + 1) * 0.02
+                        traj_lift.append(lift_qpos)
+                        
+    except Exception as e:
+        print(f"Lift planning exception: {e}")
+        print("Using fallback lift strategy - simple upward movement")
+        
+        # 备用方案：在笛卡尔空间中简单向上移动
+        cur_trans = adjusted_grasp_trans.copy()
+        cur_qpos = grasp_arm_qpos.copy()
+
+        fallback_lift_height = 0.10  
+        step_height = fallback_lift_height / lift_steps
+        
+        for step in range(lift_steps):
+            cur_trans[2] += step_height
+            
+            # 尝试IK求解，如果失败就使用线性插值
+            try:
+                success, new_qpos = env.humanoid_robot_model.ik(
+                    trans=cur_trans,
+                    rot=target_rot,
+                    init_qpos=cur_qpos,
+                    retry_times=1  
+                )
+                if success:
+                    cur_qpos = new_qpos.copy()
+                    traj_lift.append(cur_qpos.copy())
+                else:
+                    # IK失败时，使用从当前位置的线性插值
+                    if len(traj_lift) > 0:
+                        # 基于上一个成功位置进行小幅插值
+                        prev_qpos = traj_lift[-1]
+                        # 模拟缓慢抬起
+                        delta_qpos = (prev_qpos - grasp_arm_qpos) * 0.1  
+                        next_qpos = prev_qpos + delta_qpos
+                        traj_lift.append(next_qpos.copy())
+                    else:
+                        # 如果还没有成功点，就重复抓取位置（保持静止）
+                        traj_lift.append(grasp_arm_qpos.copy())
+            except Exception:
+                # 静止不动
+                if len(traj_lift) > 0:
+                    traj_lift.append(traj_lift[-1].copy())
+                else:
+                    traj_lift.append(grasp_arm_qpos.copy())
+    
+    # 如果轨迹太短，补充到指定长度
+    while len(traj_lift) < lift_steps:
+        if len(traj_lift) > 0:
+            traj_lift.append(traj_lift[-1].copy())
+        else:
             traj_lift.append(grasp_arm_qpos.copy())
+    
+    print(f"Planned trajectories - Reach: {len(traj_reach)}, Squeeze: {len(traj_squeeze)}, Lift: {len(traj_lift)}")
     
     # 检查轨迹有效性
     if len(traj_reach) == 0:
