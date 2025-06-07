@@ -117,6 +117,8 @@ def detect_driller_pose(img, depth, camera_matrix, camera_pose, pose_est_method,
     points_drill = points_world[get_workspace_mask(points_world)]  # 过滤到工作空间内的点
 
     # 使用RANSAC进行平面分割以移除桌面点
+
+    # 使用RANSAC进行平面分割以移除桌面点
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points_drill)
     
@@ -140,6 +142,9 @@ def detect_driller_pose(img, depth, camera_matrix, camera_pose, pose_est_method,
     # plotly_vis_points(points_drill, title="Drill Points in Workspace")
 
     # open3d 可视化一下points
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(points_drill)
+    o3d.visualization.draw_geometries([pcd])
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points_drill)
     o3d.visualization.draw_geometries([pcd])
