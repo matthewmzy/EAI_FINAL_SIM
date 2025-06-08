@@ -9,16 +9,17 @@ from scipy.spatial.transform import Rotation as R
 
 from src.type import Grasp
 from src.utils import to_pose
-from src.sim.wrapper_env import WrapperEnvConfig, WrapperEnv
-from src.sim.wrapper_env import get_grasps
+if True:
+    from src.real.wrapper_env import WrapperEnvConfig, WrapperEnv
+    from src.real.wrapper_env import get_grasps
+else:
+    from src.sim.wrapper_env import WrapperEnvConfig, WrapperEnv
+    from src.sim.wrapper_env import get_grasps
 from src.test.load_test import load_test_data
 from termcolor import cprint
 from PIL import Image
 
 import torch
-from sam2.build_sam import build_sam2
-from sam2.sam2_image_predictor import SAM2ImagePredictor
-from ultralytics import YOLO
 
 import open3d as o3d
 import plotly.io as pio
@@ -251,12 +252,11 @@ def forward_quad_policy(current_pose, target_pose, *args, **kwargs):
     target_trans = target_pose
     direction = target_trans - current_trans
     distance = np.linalg.norm(direction)
-    speed = 0.25 if args[0] else 0.5
-    if distance > 0.01:
-        velocity = direction / distance * speed  # 速度大小为 0.1 m/s
+    if distance > 0.1:
+        velocity = direction / distance * 0.5  # 速度大小为 0.1 m/s
     else:
         velocity = np.array([0, 0, 0])
-    action = np.array([velocity[0], velocity[1], 0]) if args[0] else np.array([-velocity[0], -velocity[1], 0])
+    action = np.array([-velocity[0], -velocity[1], 0])  # xy 平面速度，角速度为 0, 机器狗头朝-x所以加个负号
     return action
 
 def backward_quad_policy(current_quad_base_pose, initial_quad_base_pos, *args, **kwargs):
@@ -284,7 +284,7 @@ def backward_quad_policy(current_quad_base_pose, initial_quad_base_pos, *args, *
     # 计算2D平面上的距离（忽略Z轴，因为我们主要关心水平移动）
     distance_xy = np.linalg.norm(direction[:2]) # 只考虑XY平面距离
 
-    speed = 0.25 if args[0] else 0.5  # m/s，机器狗的线速度，与前进策略保持一致，确保平稳。
+    speed = 0.5 if args[0] else 0.75  # m/s，机器狗的线速度，与前进策略保持一致，确保平稳。
     angular_speed = 0.0 # 暂不考虑旋转，保持机器狗方向不变，专注于倒退。
 
     # 如果机器狗已经非常接近目标位置，则停止运动，避免来回抖动。
@@ -840,14 +840,14 @@ def plan_move(env: WrapperEnv, begin_qpos, begin_trans, begin_rot, end_trans, en
     # --- Phase 3: 保持稳定阶段 ---
     # 在完成所有移动后，保持最终姿态一段时间，让机械臂稳定。
     if hold_seconds > 0:
-        sim_dt = 0.02 # 假设环境步长，如果 env.config.ctrl_dt 可用，请使用环境配置
+        real_dt = 0.02 # 假设环境步长，如果 env.config.ctrl_dt 可用，请使用环境配置
         try:
             # 尝试从环境中获取实际的步长，如果环境对象有这个属性的话
-            sim_dt = env.config.ctrl_dt
+            real_dt = env.config.ctrl_dt
         except Exception:
             cprint("无法从 env 获取 ctrl_dt，将使用默认dt。", 'yellow')
 
-        hold_steps = max(1, int(hold_seconds / sim_dt)) # 确保至少 1 步
+        hold_steps = max(1, int(hold_seconds / real_dt)) # 确保至少 1 步
         cprint(f"\n--- Phase 3: 增加 {hold_seconds:.2f} 秒 ({hold_steps} 步) 稳定等待时间 ---", 'blue')
         # 将最后的关节位置重复 hold_steps 次，实现保持效果
         for _ in range(hold_steps):
@@ -959,23 +959,23 @@ def main():
     #                                 np.eye(3)), mocap_id='debug_axis_0')   
 
     runtime_name = time.strftime("%Y%m%d_%H%M%S")
-
+    """"
     # --------------------------------------step 1: move quadruped to dropping position--------------------------------------
     if not DISABLE_MOVE:
-        forward_steps = 5000
+        forward_steps = 50
         steps_per_camera_shot = 5
         head_camera_matrix = env.sim.humanoid_robot_cfg.camera_cfg[0].intrinsics
         head_camera_params = (head_camera_matrix[0, 0], head_camera_matrix[1, 1], head_camera_matrix[0, 2], head_camera_matrix[1, 2])
         target_container_pose = np.array([0.65, 0.0, 0.0])
-        
+
         # Proportional control gains
         Kp_linear = 0.5  # For head tracking (unchanged)
         Kp_angular = 50  # For turning control
-        
+
         def is_close(current_pose, target_pose, threshold=0.05):
             distance = np.linalg.norm(current_pose[:2] - target_pose[:2])
             return distance < threshold
-        
+
         initial_quad_reset_pose = None
         turning_steps_remaining = 0  # Track remaining turning steps
         turned = False
@@ -1016,42 +1016,116 @@ def main():
                     if initial_quad_reset_pose is None:
                         initial_quad_reset_pose = pose_container_world
                         initial_quad_reset_pos = trans_container_world
-                    env.sim.debug_vis_pose(pose_container_world, mocap_id='debug_axis_1')
+                        # env.sim.debug_vis_pose(pose_container_world, mocap_id='debug_axis_1')
                 else:
                     pose_container_world = None
-
+                
                 if pose_container_world is not None:
                     if turning_steps_remaining > 0:
                         # In turning phase: optimize pose[0, 1] to 1
                         orientation_error = 1.0 - pose_container_world[0, 1]  # Target pose[0, 1] = 1
                         angular_vel = Kp_angular * orientation_error  # Proportional control
                         angular_vel = np.clip(angular_vel, -1.0, 1.0)  # Limit angular velocity
-                        quad_command = np.array([0, 0, angular_vel])
+                        quad_command = np.array([0, 0, float(angular_vel)])  # Convert to Python float
                         turning_steps_remaining -= 1
                         cprint(f"[Step {step}] Turning: {turning_steps_remaining} steps left, pose[0, 1]={pose_container_world[0, 1]:.3f}, angular_vel={angular_vel:.3f}", 'green')
                         if turning_steps_remaining == 0:
                             turned = True
-                            cprint("[INFO] Completed 200-step turning phase.", 'green')
+                            cprint("[INFO] Completed 20-step turning phase.", 'green')
                     else:
                         # Check if close to target to initiate turning
-                        if not turned and abs(pose_container_world[0, 3] - target_container_pose[0]) < 0.4:
-                            cprint("[INFO] Almost reached target container position, starting 200-step turn.", 'green')
-                            turning_steps_remaining = 200  # Start fixed 200-step turning phase
-                            quad_command = np.array([0, 0, 0])  # Initialize to zero, will be set in next iteration
+                        if not turned and abs(pose_container_world[0, 3] - target_container_pose[0]) < 0.3:
+                            cprint("[INFO] Almost reached target container position, starting 20-step turn.", 'green')
+                            turning_steps_remaining = 20  # Start fixed 200-step turning phase
+                            quad_command = np.array([0, 0, 0], dtype=float)  # Initialize to zero, ensure float
                         elif is_close(pose_container_world[:3, 3], target_container_pose, threshold=0.05):
                             cprint("[INFO] Close enough, jump out of the loop.", 'green')
-                            quad_command = np.array([0, 0, 0])
+                            quad_command = np.array([0, 0, 0], dtype=float)  # Ensure float
                             break
                         else:
                             quad_command = forward_quad_policy(pose_container_world, target_container_pose, turned)
+                            quad_command = np.array([float(x) for x in quad_command])  # Convert all elements to Python float
                 else:
-                    quad_command = np.array([0, 0, 0])
+                    quad_command = np.array([0, 0, 0], dtype=float)  # Ensure float
 
                 env.step_env(
                     humanoid_head_qpos=new_head_qpos,
                     quad_command=quad_command
                 )
+    """
+    # --------------------------------------step 1: move quadruped to dropping position--------------------------------------
+    if not DISABLE_MOVE:
+        forward_steps = 10
+        steps_per_camera_shot = 2
+        head_camera_matrix = env.sim.humanoid_robot_cfg.camera_cfg[0].intrinsics
+        head_camera_params = (head_camera_matrix[0, 0], head_camera_matrix[1, 1], head_camera_matrix[0, 2], head_camera_matrix[1, 2])
+        target_container_pose = np.array([0.7, 0.0, 0.0])
+        
+        # Proportional control gain
+        Kp = 0.5
 
+        def is_close(current_pose, target_pose, threshold=0.05):
+            distance = np.linalg.norm(current_pose[:2] - target_pose[:2])
+            return distance < threshold
+
+        for step in range(forward_steps): # forward_steps
+            if step % steps_per_camera_shot == 0:
+                obs_head = env.get_obs(camera_id=0)
+                # env.debug_save_obs(obs_head, runtime_name=runtime_name, step=step)  # Save head camera observation, DEBUG
+                img_height, img_width = obs_head.rgb.shape[:2]
+                image_center = (img_width / 2, img_height / 2)
+
+                trans_marker_world, rot_marker_world, marker_center = detect_marker_pose(
+                    detector,
+                    obs_head.rgb,
+                    head_camera_params,
+                    obs_head.camera_pose,
+                    tag_size=0.12
+                )
+
+                # Head tracking logic
+                current_head_qpos = env.sim.humanoid_head_qpos  # Last two joints are head joints
+                if marker_center is not None:
+                    # Calculate pixel deviation
+                    delta_x = marker_center[0] - image_center[0]
+                    delta_y = marker_center[1] - image_center[1]
+                    # cprint(f"Marker center: {marker_center}, Image center: {image_center}", 'cyan')
+                    # cprint(f"Delta x: {delta_x}, Delta y: {delta_y}", 'cyan')
+
+                    # Convert pixel deviation to angular deviation using focal lengths
+                    fx = head_camera_matrix[0, 0]
+                    fy = head_camera_matrix[1, 1]
+                    angle_delta_x = np.arctan(delta_x / fx)
+                    angle_delta_y = np.arctan(delta_y / fy)
+
+                    # Apply proportional control
+                    head_qpos_adjustment = Kp * np.array([-angle_delta_x, angle_delta_y])  # Negative due to joint orientation
+                    new_head_qpos = current_head_qpos + head_qpos_adjustment
+                    # cprint(f"Current head qpos: {current_head_qpos}, New head qpos: {new_head_qpos}", 'cyan')
+                else:
+                    new_head_qpos = current_head_qpos  # No adjustment if marker not detected
+
+                if trans_marker_world is not None:
+                    trans_container_world = rot_marker_world @ np.array([0, -0.31, 0.02]) + trans_marker_world
+                    rot_container_world = rot_marker_world
+                    pose_container_world = to_pose(trans_container_world, rot_container_world)
+                    # env.sim.debug_vis_pose(pose_container_world, mocap_id='debug_axis_1')  # Visualize the container pose
+                else:
+                    pose_container_world = None
+
+                if pose_container_world is not None:
+                    quad_command = forward_quad_policy(pose_container_world, target_container_pose)
+                    quad_command = np.array([float(x) for x in quad_command])  # Convert all elements to Python float
+                    if is_close(pose_container_world[:3, 3], target_container_pose, threshold=0.2):
+                        cprint("[INFO] Close enough, jump out of the loop.", 'green')
+                        break
+                else:
+                    quad_command = np.array([0, 0, 0], dtype=float)
+
+                env.step_env(
+                    humanoid_head_qpos=new_head_qpos,
+                    quad_command=quad_command
+                )
 
     # --------------------------------------step 2: detect driller pose------------------------------------------------------
     if not DISABLE_GRASP:
@@ -1069,7 +1143,7 @@ def main():
                                                 args.device)
             cprint(driller_pose-env.get_driller_pose(), 'cyan')
         cprint(driller_pose, 'green')
-        env.sim.debug_vis_pose(driller_pose, mocap_id='debug_axis_2') 
+        # env.sim.debug_vis_pose(driller_pose, mocap_id='debug_axis_2') 
 
         # TODO: ma zhiyuan modified here, assume the driller_pose is detected correctly
         #driller_pose = np.array([[1,0,0,0.5],[0,1,0,0.3],[0,0,1,0.75],[0,0,0,1]])
@@ -1181,7 +1255,7 @@ def main():
         
         cprint(f"Drop target pose: Trans={drop_target_trans}, Rot={drop_target_rot}", 'cyan')
         # 可视化放置目标点
-        env.sim.debug_vis_pose(to_pose(drop_target_trans, drop_target_rot), mocap_id='debug_axis_3')
+        #env.sim.debug_vis_pose(to_pose(drop_target_trans, drop_target_rot), mocap_id='debug_axis_3')
 
         # 规划移动轨迹
         move_plan_total_steps = 100  # 根据需求调整总步数
@@ -1197,7 +1271,7 @@ def main():
         ) 
         
         if move_plan is None:
-            cprint("[ERROR] Failed to plan move to drop position. Simulation halted.", 'red')
+            cprint("[ERROR] Failed to plan move to drop position. realulation halted.", 'red')
             env.close()
             return
 
@@ -1239,7 +1313,7 @@ def main():
                 rot_container_world = rot_marker_world
                 pose_container_world = to_pose(trans_container_world, rot_container_world)
                 current_quad_base_pose = pose_container_world
-                env.sim.debug_vis_pose(pose_container_world, mocap_id='debug_axis_1')
+                #env.sim.debug_vis_pose(pose_container_world, mocap_id='debug_axis_1')
             else:
                 current_quad_base_pose = None
 
@@ -1290,7 +1364,7 @@ def main():
 
     print("Metrics:", Metric) 
 
-    print("Simulation completed.")
+    print("realulation completed.")
     env.close()
 
 if __name__ == "__main__":
