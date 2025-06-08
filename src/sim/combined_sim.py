@@ -263,7 +263,7 @@ class CombinedSim:
         mode_kwargs = dict(
             rgb=dict(),
             depth=dict(depth=True),
-            seg=dict(segmentation=True),
+            seg=dict(segmentation=False),
         )
         if camera_pose is not None:
             if camera_id == 0:

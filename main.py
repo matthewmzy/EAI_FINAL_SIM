@@ -191,10 +191,10 @@ def detect_driller_pose(img, depth, camera_matrix, camera_pose, pose_est_method,
         driller_pose = result_ransac.transformation
 
         # 可视化obs_pcd和配准后的full_pcd
-        source_pcd.transform(driller_pose)
-        source_pcd.paint_uniform_color([1, 0, 0])
-        target_pcd.paint_uniform_color([0, 1, 0])
-        o3d.visualization.draw_geometries([source_pcd, target_pcd], window_name="Driller Pose Estimation")
+        # source_pcd.transform(driller_pose)
+        # source_pcd.paint_uniform_color([1, 0, 0])
+        # target_pcd.paint_uniform_color([0, 1, 0])
+        # o3d.visualization.draw_geometries([source_pcd, target_pcd], window_name="Driller Pose Estimation")
             
     else:
         """ 用作业二估pose """
@@ -251,11 +251,12 @@ def forward_quad_policy(current_pose, target_pose, *args, **kwargs):
     target_trans = target_pose
     direction = target_trans - current_trans
     distance = np.linalg.norm(direction)
+    speed = 0.25 if args[0] else 0.5
     if distance > 0.01:
-        velocity = direction / distance * 0.5  # 速度大小为 0.1 m/s
+        velocity = direction / distance * speed  # 速度大小为 0.1 m/s
     else:
         velocity = np.array([0, 0, 0])
-    action = np.array([-velocity[0], -velocity[1], 0])  # xy 平面速度，角速度为 0, 机器狗头朝-x所以加个负号
+    action = np.array([velocity[0], velocity[1], 0]) if args[0] else np.array([-velocity[0], -velocity[1], 0])
     return action
 
 def backward_quad_policy(current_quad_base_pose, initial_quad_base_pos, *args, **kwargs):
@@ -283,7 +284,7 @@ def backward_quad_policy(current_quad_base_pose, initial_quad_base_pos, *args, *
     # 计算2D平面上的距离（忽略Z轴，因为我们主要关心水平移动）
     distance_xy = np.linalg.norm(direction[:2]) # 只考虑XY平面距离
 
-    speed = 0.5  # m/s，机器狗的线速度，与前进策略保持一致，确保平稳。
+    speed = 0.25 if args[0] else 0.5  # m/s，机器狗的线速度，与前进策略保持一致，确保平稳。
     angular_speed = 0.0 # 暂不考虑旋转，保持机器狗方向不变，专注于倒退。
 
     # 如果机器狗已经非常接近目标位置，则停止运动，避免来回抖动。
@@ -303,7 +304,7 @@ def backward_quad_policy(current_quad_base_pose, initial_quad_base_pos, *args, *
         # 若想在世界X轴负方向移动，`quad_command[0]` 需为正值。
         # 这里 `velocity_world[0]` 是世界X方向的期望速度。
         # 对应的 `quad_command[0]` 应是其反向。
-        action = np.array([-velocity_world[0], -velocity_world[1], angular_speed])
+        action = np.array([-velocity_world[0], -velocity_world[1], angular_speed]) if args[0] else np.array([velocity_world[0], velocity_world[1], angular_speed])
         
         cprint(f"倒退中... 当前距离目标: {distance_xy:.3f}m, 世界速度: [{velocity_world[0]:.3f}, {velocity_world[1]:.3f}], 机器狗指令: [{action[0]:.3f}, {action[1]:.3f}]", 'blue')
 
@@ -703,7 +704,8 @@ def binary_search_xy_coordinate(env, init_qpos, current_start_trans_xy, target_c
                 trans=test_trans,
                 rot=fixed_rot, # 使用固定的旋转姿态
                 init_qpos=init_qpos,
-                retry_times=ik_retries
+                retry_times=ik_retries,
+                rot_tol=1,  # 不限制旋转
             )
             if success:
                 best_alpha = mid_alpha
@@ -960,20 +962,25 @@ def main():
 
     # --------------------------------------step 1: move quadruped to dropping position--------------------------------------
     if not DISABLE_MOVE:
-        forward_steps = 1000
+        forward_steps = 5000
         steps_per_camera_shot = 5
         head_camera_matrix = env.sim.humanoid_robot_cfg.camera_cfg[0].intrinsics
         head_camera_params = (head_camera_matrix[0, 0], head_camera_matrix[1, 1], head_camera_matrix[0, 2], head_camera_matrix[1, 2])
-        target_container_pose = np.array([0.7, 0.0, 0.0])
+        target_container_pose = np.array([0.65, 0.0, 0.0])
         
-        # Proportional control gain
-        Kp = 0.5
-
+        # Proportional control gains
+        Kp_linear = 0.5  # For head tracking (unchanged)
+        Kp_angular = 50  # For turning control
+        
         def is_close(current_pose, target_pose, threshold=0.05):
             distance = np.linalg.norm(current_pose[:2] - target_pose[:2])
             return distance < threshold
+        
+        initial_quad_reset_pose = None
+        turning_steps_remaining = 0  # Track remaining turning steps
+        turned = False
 
-        for step in range(forward_steps): # forward_steps
+        for step in range(forward_steps):
             if step % steps_per_camera_shot == 0:
                 obs_head = env.get_obs(camera_id=0)
                 # env.debug_save_obs(obs_head, runtime_name=runtime_name, step=step)  # Save head camera observation, DEBUG
@@ -988,41 +995,55 @@ def main():
                     tag_size=0.12
                 )
 
-                # Head tracking logic
-                current_head_qpos = env.sim.humanoid_head_qpos  # Last two joints are head joints
+                # Head tracking logic (unchanged)
+                current_head_qpos = env.sim.humanoid_head_qpos
                 if marker_center is not None:
-                    # Calculate pixel deviation
                     delta_x = marker_center[0] - image_center[0]
                     delta_y = marker_center[1] - image_center[1]
-                    # cprint(f"Marker center: {marker_center}, Image center: {image_center}", 'cyan')
-                    # cprint(f"Delta x: {delta_x}, Delta y: {delta_y}", 'cyan')
-
-                    # Convert pixel deviation to angular deviation using focal lengths
                     fx = head_camera_matrix[0, 0]
                     fy = head_camera_matrix[1, 1]
                     angle_delta_x = np.arctan(delta_x / fx)
                     angle_delta_y = np.arctan(delta_y / fy)
-
-                    # Apply proportional control
-                    head_qpos_adjustment = Kp * np.array([-angle_delta_x, angle_delta_y])  # Negative due to joint orientation
+                    head_qpos_adjustment = Kp_linear * np.array([-angle_delta_x, angle_delta_y])
                     new_head_qpos = current_head_qpos + head_qpos_adjustment
-                    # cprint(f"Current head qpos: {current_head_qpos}, New head qpos: {new_head_qpos}", 'cyan')
                 else:
-                    new_head_qpos = current_head_qpos  # No adjustment if marker not detected
+                    new_head_qpos = current_head_qpos
 
                 if trans_marker_world is not None:
                     trans_container_world = rot_marker_world @ np.array([0, -0.31, 0.02]) + trans_marker_world
                     rot_container_world = rot_marker_world
                     pose_container_world = to_pose(trans_container_world, rot_container_world)
-                    env.sim.debug_vis_pose(pose_container_world, mocap_id='debug_axis_1')  # Visualize the container pose
+                    if initial_quad_reset_pose is None:
+                        initial_quad_reset_pose = pose_container_world
+                        initial_quad_reset_pos = trans_container_world
+                    env.sim.debug_vis_pose(pose_container_world, mocap_id='debug_axis_1')
                 else:
                     pose_container_world = None
 
                 if pose_container_world is not None:
-                    quad_command = forward_quad_policy(pose_container_world, target_container_pose)
-                    if is_close(pose_container_world[:3, 3], target_container_pose, threshold=0.05):
-                        cprint("[INFO] Close enough, jump out of the loop.", 'green')
-                        break
+                    if turning_steps_remaining > 0:
+                        # In turning phase: optimize pose[0, 1] to 1
+                        orientation_error = 1.0 - pose_container_world[0, 1]  # Target pose[0, 1] = 1
+                        angular_vel = Kp_angular * orientation_error  # Proportional control
+                        angular_vel = np.clip(angular_vel, -1.0, 1.0)  # Limit angular velocity
+                        quad_command = np.array([0, 0, angular_vel])
+                        turning_steps_remaining -= 1
+                        cprint(f"[Step {step}] Turning: {turning_steps_remaining} steps left, pose[0, 1]={pose_container_world[0, 1]:.3f}, angular_vel={angular_vel:.3f}", 'green')
+                        if turning_steps_remaining == 0:
+                            turned = True
+                            cprint("[INFO] Completed 200-step turning phase.", 'green')
+                    else:
+                        # Check if close to target to initiate turning
+                        if not turned and abs(pose_container_world[0, 3] - target_container_pose[0]) < 0.4:
+                            cprint("[INFO] Almost reached target container position, starting 200-step turn.", 'green')
+                            turning_steps_remaining = 200  # Start fixed 200-step turning phase
+                            quad_command = np.array([0, 0, 0])  # Initialize to zero, will be set in next iteration
+                        elif is_close(pose_container_world[:3, 3], target_container_pose, threshold=0.05):
+                            cprint("[INFO] Close enough, jump out of the loop.", 'green')
+                            quad_command = np.array([0, 0, 0])
+                            break
+                        else:
+                            quad_command = forward_quad_policy(pose_container_world, target_container_pose, turned)
                 else:
                     quad_command = np.array([0, 0, 0])
 
@@ -1184,53 +1205,82 @@ def main():
         execute_plan(env, move_plan)
         
         cprint("Opening gripper to drop object...", 'green')
-        open_gripper(env, steps=15) # 增加步数，确保夹爪完全打开
+        open_gripper(env, steps=50) # 增加步数，确保夹爪完全打开
         cprint("Drop completed.", 'green')
 
 
     # --------------------------------------step 5: move quadruped backward to initial position------------------------------
     if not DISABLE_MOVE:
         cprint("\n--- 开始执行 Step 5: 机器狗倒退回初始位置 ---", 'yellow')
-
-        # 获取机器狗的初始重置位置，作为本次倒退的目标点
-        initial_quad_reset_pos = data_dict['quad_reset_pos']
         cprint(f"目标初始位置: ({initial_quad_reset_pos[0]:.3f}, {initial_quad_reset_pos[1]:.3f}, {initial_quad_reset_pos[2]:.3f})", 'cyan')
 
-        # 定义一个函数来判断机器狗是否已经足够接近目标位置
-        def is_quad_close_to_initial(current_quad_pose_matrix, target_initial_pos_vector, threshold=0.01): # 阈值设定为1厘米
-            current_pos_xy = current_quad_pose_matrix[:2, 3] # 从4x4位姿矩阵中提取当前的XY坐标
-            target_pos_xy = target_initial_pos_vector[:2] # 从目标向量中提取XY坐标
-            distance = np.linalg.norm(current_pos_xy - target_pos_xy) # 计算欧几里得距离
+        def is_quad_close_to_initial(current_quad_pose_matrix, target_initial_pos_vector, threshold=0.01):
+            current_pos_xy = current_quad_pose_matrix[:2, 3]
+            target_pos_xy = target_initial_pos_vector[:2]
+            distance = np.linalg.norm(current_pos_xy - target_pos_xy)
             return distance < threshold
 
-        backward_steps = 1000 # 设定最大倒退步数，防止无限循环
+        backward_steps = 1000
+        turning_steps_remaining = 0  # Track remaining turning steps
+        turned = False
 
         for step in range(backward_steps):
-            # 获取机器狗当前的基座位姿（在世界坐标系中）
-            current_quad_base_pose = env.get_quad_pose() 
+            obs_head = env.get_obs(camera_id=0)
+            # env.debug_save_obs(obs_head, runtime_name=runtime_name, step=step)
+            trans_marker_world, rot_marker_world, marker_center = detect_marker_pose(
+                detector,
+                obs_head.rgb,
+                head_camera_params,
+                obs_head.camera_pose,
+                tag_size=0.12
+            )
+            if trans_marker_world is not None:
+                trans_container_world = rot_marker_world @ np.array([0, -0.31, 0.02]) + trans_marker_world
+                rot_container_world = rot_marker_world
+                pose_container_world = to_pose(trans_container_world, rot_container_world)
+                current_quad_base_pose = pose_container_world
+                env.sim.debug_vis_pose(pose_container_world, mocap_id='debug_axis_1')
+            else:
+                current_quad_base_pose = None
 
-            # 检查是否已经到达目标位置附近
-            if is_quad_close_to_initial(current_quad_base_pose, initial_quad_reset_pos):
-                cprint(f"机器狗已成功返回初始位置附近，总共用时 {step} 步。", 'green')
-                # 到达目标后，发送停止命令
-                env.step_env(quad_command=np.array([0.0, 0.0, 0.0]))
-                break # 退出循环
+            if current_quad_base_pose is not None:
+                if is_quad_close_to_initial(current_quad_base_pose, initial_quad_reset_pos):
+                    cprint(f"机器狗已成功返回初始位置附近，总共用时 {step} 步。", 'green')
+                    env.step_env(quad_command=np.array([0.0, 0.0, 0.0]))
+                    break
+                if turning_steps_remaining > 0:
+                    # In turning phase: optimize pose[0, 1] to -1
+                    orientation_error = -1.0 - current_quad_base_pose[0, 1]  # Target pose[0, 1] = -1
+                    angular_vel = Kp_angular * orientation_error  # Proportional control
+                    angular_vel = np.clip(angular_vel, -1.0, 1.0)  # Limit angular velocity
+                    quad_command = np.array([0, 0, angular_vel])
+                    turning_steps_remaining -= 1
+                    cprint(f"[Step {step}] Turning: {turning_steps_remaining} steps left, pose[0, 1]={current_quad_base_pose[0, 1]:.3f}, angular_vel={angular_vel:.3f}", 'green')
+                    if turning_steps_remaining == 0:
+                        turned = True
+                        cprint("[INFO] Completed 200-step turning phase.", 'green')
+                else:
+                    if not turned and abs(current_quad_base_pose[0, 3] - target_container_pose[0]) > 0.55:
+                        cprint("[INFO] Almost left target position, starting 200-step turn.", 'green')
+                        turning_steps_remaining = 200  # Start fixed 200-step turning phase
+                        quad_command = np.array([0, 0, 0])  # Initialize to zero, will be set in next iteration
+                    else:
+                        quad_command = backward_quad_policy(current_quad_base_pose, initial_quad_reset_pos, turned)
+            else:
+                quad_command = np.array([0, 0, 0])
 
-            # 调用我们实现的倒退策略来获取控制命令
-            quad_command = backward_quad_policy(current_quad_base_pose, initial_quad_reset_pos)
-            
-            # 将控制命令应用到仿真环境中
             env.step_env(quad_command=quad_command)
-            
-            # 为了调试和监控，可以每隔一定步数打印进度
-            if step % 100 == 0: # 每100步打印一次
-                current_quad_pos_xy = current_quad_base_pose[:2, 3]
-                distance_to_target = np.linalg.norm(current_quad_pos_xy - initial_quad_reset_pos[:2])
-                cprint(f"Step {step}/{backward_steps}: 机器狗当前XY: ({current_quad_pos_xy[0]:.3f}, {current_quad_pos_xy[1]:.3f}), 距离初始点: {distance_to_target:.3f}m。", 'blue')
-        else: # 如果循环在达到最大步数时结束，说明未完全回到初始位置
+
+            if step % 100 == 0:
+                if current_quad_base_pose is not None:
+                    current_quad_pos_xy = current_quad_base_pose[:2, 3]
+                    distance_to_target = np.linalg.norm(current_quad_pos_xy - initial_quad_reset_pos[:2])
+                    cprint(f"Step {step}/{backward_steps}: 机器狗当前XY: ({current_quad_pos_xy[0]:.3f}, {current_quad_pos_xy[1]:.3f}), 距离初始点: {distance_to_target:.3f}m。", 'blue')
+                else:
+                    cprint(f"Step {step}/{backward_steps}: 未检测到当前位姿。", 'yellow')
+        else:
             cprint(f"警告: 机器狗在 {backward_steps} 步内未能完全返回初始位置。", 'yellow')
 
-        # 更新四足机器狗返回指标
         Metric["quad_return"] = Metric["quad_return"] or env.metric_quad_return()
         cprint(f"更新: 四足机器狗返回状态: {Metric['quad_return']}", 'green')
 
