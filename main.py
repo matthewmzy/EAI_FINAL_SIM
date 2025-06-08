@@ -142,12 +142,12 @@ def detect_driller_pose(img, depth, camera_matrix, camera_pose, pose_est_method,
     # plotly_vis_points(points_drill, title="Drill Points in Workspace")
 
     # open3d 可视化一下points
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points_drill)
-    o3d.visualization.draw_geometries([pcd])
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points_drill)
-    o3d.visualization.draw_geometries([pcd])
+    # pcd = o3d.geometry.PointCloud()
+    # pcd.points = o3d.utility.Vector3dVector(points_drill)
+    # o3d.visualization.draw_geometries([pcd])
+    # pcd = o3d.geometry.PointCloud()
+    # pcd.points = o3d.utility.Vector3dVector(points_drill)
+    # o3d.visualization.draw_geometries([pcd])
 
     if pose_est_method == "registration":
         """ 点云配准 """
@@ -1060,6 +1060,12 @@ def main():
     # --------------------------------------step 3: plan grasp and lift------------------------------------------------------
     if not DISABLE_GRASP:
         obj_pose = driller_pose.copy()
+        """ trick: 翻转用于抓取的物体坐标系，使得旋转的x轴指向x轴正方向 """
+        if args.obj == 'power_drill' and sum(obj_pose[:3, 0]) < 0:
+            cprint("[INFO] Detected power drill with flipped x-axis, flipping the pose.", 'yellow')
+            # 绕z轴旋转180度
+            obj_pose[:3, :3] = obj_pose[:3, :3] @ np.diag([-1, -1, 1])
+            env.sim.debug_vis_pose(obj_pose, mocap_id='debug_axis_4')  # 可视化翻转后的物体姿态
         grasps = get_grasps(args.obj) 
         grasps0_n = Grasp(grasps[0].trans, grasps[0].rot @ np.diag([-1,-1,1]), grasps[0].width)
         grasps2_n = Grasp(grasps[2].trans, grasps[2].rot @ np.diag([-1,-1,1]), grasps[2].width)
